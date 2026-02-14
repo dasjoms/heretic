@@ -3,7 +3,9 @@
 
 from enum import Enum
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
+
+import tomllib
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import (
@@ -17,6 +19,44 @@ from pydantic_settings import (
 
 def _bundled_prompt_file_path(name: str) -> str:
     return str(Path(__file__).resolve().parent / "prompts" / name)
+
+
+def get_configuration_diagnostics() -> dict[str, Any]:
+    files = _find_existing_config_files()
+    details: list[dict[str, Any]] = []
+
+    for file in files:
+        path = Path(file)
+        entry: dict[str, Any] = {"path": str(path), "exists": path.exists()}
+
+        if path.exists() and path.is_file():
+            try:
+                with path.open("rb") as handle:
+                    data = tomllib.load(handle)
+
+                entry["has_model"] = "model" in data
+
+                for group in (
+                    "good_prompts",
+                    "bad_prompts",
+                    "good_evaluation_prompts",
+                    "bad_evaluation_prompts",
+                ):
+                    group_data = data.get(group)
+                    if isinstance(group_data, dict):
+                        entry[group] = {
+                            "source_type": group_data.get("source_type"),
+                            "dataset": group_data.get("dataset"),
+                            "path": group_data.get("path"),
+                            "split": group_data.get("split"),
+                            "column": group_data.get("column"),
+                        }
+            except Exception as error:
+                entry["error"] = str(error)
+
+        details.append(entry)
+
+    return {"candidate_files": files, "details": details}
 
 
 def _find_existing_config_files() -> list[str]:
@@ -78,7 +118,9 @@ class DatasetSpecification(BaseModel):
         description="Hugging Face dataset ID, or path to dataset on disk.",
     )
 
-    split: str | None = Field(default=None, description="Portion of the dataset to use.")
+    split: str | None = Field(
+        default=None, description="Portion of the dataset to use."
+    )
 
     column: str | None = Field(
         default=None,
