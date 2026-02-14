@@ -64,6 +64,11 @@ class DatasetSpecification(BaseModel):
         description="Whether to skip blank lines when loading prompts from text files.",
     )
 
+    strip_whitespace: bool = Field(
+        default=False,
+        description="Whether to strip leading/trailing whitespace from each line in text files.",
+    )
+
     comment_prefix: str | None = Field(
         default=None,
         description="Prefix identifying comment lines to ignore in text files.",

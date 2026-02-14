@@ -4,6 +4,7 @@
 import gc
 import getpass
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
@@ -202,6 +203,62 @@ def _load_dataset_prompts(specification: DatasetSpecification) -> list[str]:
     return list(dataset[specification.column])
 
 
+def _format_incompatible_options_error(
+    source_type: PromptSourceType,
+    source_identifier: str,
+    option_names: Iterable[str],
+) -> ValueError:
+    options = ", ".join(sorted(option_names))
+    return ValueError(
+        f"Unsupported options for {source_type.value} source '{source_identifier}': "
+        f"{options}."
+    )
+
+
+def _validate_source_options(specification: DatasetSpecification) -> None:
+    if specification.source_type == PromptSourceType.DATASET:
+        assert specification.dataset is not None
+        incompatible_options = []
+        if specification.path is not None:
+            incompatible_options.append("path")
+        if specification.encoding != "utf-8":
+            incompatible_options.append("encoding")
+        if not specification.skip_blank_lines:
+            incompatible_options.append("skip_blank_lines")
+        if specification.strip_whitespace:
+            incompatible_options.append("strip_whitespace")
+        if specification.comment_prefix is not None:
+            incompatible_options.append("comment_prefix")
+        if specification.max_prompts is not None:
+            incompatible_options.append("max_prompts")
+        if specification.start_index != 0:
+            incompatible_options.append("start_index")
+
+        if incompatible_options:
+            raise _format_incompatible_options_error(
+                specification.source_type,
+                specification.dataset,
+                incompatible_options,
+            )
+        return
+
+    assert specification.path is not None
+    incompatible_options = []
+    if specification.dataset is not None:
+        incompatible_options.append("dataset")
+    if specification.split is not None:
+        incompatible_options.append("split")
+    if specification.column is not None:
+        incompatible_options.append("column")
+
+    if incompatible_options:
+        raise _format_incompatible_options_error(
+            specification.source_type,
+            specification.path,
+            incompatible_options,
+        )
+
+
 def _load_text_file_prompts(specification: DatasetSpecification) -> list[str]:
     assert specification.path is not None
 
@@ -209,8 +266,23 @@ def _load_text_file_prompts(specification: DatasetSpecification) -> list[str]:
     if not source_path.is_absolute():
         source_path = Path.cwd() / source_path
 
-    with source_path.open(encoding=specification.encoding) as file:
-        prompts = file.read().splitlines()
+    if not source_path.exists():
+        raise ValueError(f"Text prompt file not found: '{source_path}'.")
+    if source_path.is_dir():
+        raise ValueError(
+            f"Text prompt source must be a file, not a directory: '{source_path}'."
+        )
+
+    try:
+        with source_path.open(encoding=specification.encoding, newline=None) as file:
+            prompts = file.read().splitlines()
+    except OSError as error:
+        raise ValueError(
+            f"Could not read text prompt file '{source_path}': {error}."
+        ) from error
+
+    if specification.strip_whitespace:
+        prompts = [prompt.strip() for prompt in prompts]
 
     if specification.comment_prefix is not None:
         prompts = [
@@ -232,10 +304,18 @@ def load_prompts(
     settings: Settings,
     specification: DatasetSpecification,
 ) -> list[Prompt]:
+    _validate_source_options(specification)
+
     if specification.source_type == PromptSourceType.TEXT_FILE:
         prompts = _load_text_file_prompts(specification)
     else:
         prompts = _load_dataset_prompts(specification)
+
+    if not prompts:
+        raise ValueError(
+            f"No prompts were loaded from {specification.source_type.value} source "
+            f"'{specification.source_label()}'."
+        )
 
     if specification.prefix:
         prompts = [f"{specification.prefix} {prompt}" for prompt in prompts]
