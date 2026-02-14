@@ -246,6 +246,8 @@ def run():
         existing_study = None
 
     if existing_study is not None and settings.evaluate_model is None:
+        saved_settings = Settings.model_validate_json(existing_study.user_attrs["settings"])
+        settings_changed = saved_settings.model_dump() != settings.model_dump()
         choices = []
 
         if existing_study.user_attrs["finished"]:
@@ -266,27 +268,50 @@ def run():
             )
         else:
             print()
-            print(
-                (
-                    "[yellow]You have already processed this model, but the run was interrupted.[/] "
-                    "You can continue the previous run from where it stopped. This will override any specified settings. "
-                    "Alternatively, you can ignore the previous run and start from scratch. "
-                    "This will delete the checkpoint file and all results from the previous run."
+            if settings_changed:
+                print(
+                    (
+                        "[yellow]You have already processed this model, but the run was interrupted.[/] "
+                        "The checkpoint settings differ from your current configuration. "
+                        "Restarting will use your current settings. "
+                        "Continuing will override your current settings with the checkpoint settings."
+                    )
                 )
-            )
+                choices.append(
+                    Choice(
+                        title="Ignore the previous run and start from scratch (use current settings)",
+                        value="restart",
+                    )
+                )
+                choices.append(
+                    Choice(
+                        title="Continue the previous run (override with checkpoint settings)",
+                        value="continue",
+                    )
+                )
+            else:
+                print(
+                    (
+                        "[yellow]You have already processed this model, but the run was interrupted.[/] "
+                        "You can continue the previous run from where it stopped. This will override any specified settings. "
+                        "Alternatively, you can ignore the previous run and start from scratch. "
+                        "This will delete the checkpoint file and all results from the previous run."
+                    )
+                )
+                choices.append(
+                    Choice(
+                        title="Continue the previous run",
+                        value="continue",
+                    )
+                )
+
+        if not settings_changed:
             choices.append(
                 Choice(
-                    title="Continue the previous run",
-                    value="continue",
+                    title="Ignore the previous run and start from scratch",
+                    value="restart",
                 )
             )
-
-        choices.append(
-            Choice(
-                title="Ignore the previous run and start from scratch",
-                value="restart",
-            )
-        )
 
         choices.append(
             Choice(
@@ -299,8 +324,9 @@ def run():
         choice = prompt_select("How would you like to proceed?", choices)
 
         if choice == "continue":
-            settings = Settings.model_validate_json(
-                existing_study.user_attrs["settings"]
+            settings = saved_settings
+            print(
+                "[yellow]Resuming with checkpoint settings. Current configuration was overridden.[/]"
             )
         elif choice == "restart":
             os.unlink(study_checkpoint_file)
