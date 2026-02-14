@@ -2,6 +2,7 @@
 # Copyright (C) 2025-2026  Philipp Emanuel Weidmann <pew@worldwidemann.com> + contributors
 
 from enum import Enum
+from pathlib import Path
 from typing import Dict
 
 from pydantic import BaseModel, Field, model_validator
@@ -12,6 +13,37 @@ from pydantic_settings import (
     PydanticBaseSettingsSource,
     TomlConfigSettingsSource,
 )
+
+
+def _find_existing_config_files() -> list[str]:
+    """
+    Returns candidate configuration files in precedence order.
+
+    Search strategy:
+    1) Current working directory and each parent directory.
+    2) Repository root (derived from this source file), as a fallback.
+
+    For each location, ``config.toml`` takes precedence over
+    ``config.default.toml``.
+    """
+
+    candidate_names = ("config.toml", "config.default.toml")
+    candidates: list[Path] = []
+
+    cwd = Path.cwd().resolve()
+    for directory in [cwd, *cwd.parents]:
+        for name in candidate_names:
+            path = directory / name
+            if path.exists() and path.is_file():
+                candidates.append(path)
+
+    repository_root = Path(__file__).resolve().parents[2]
+    for name in candidate_names:
+        path = repository_root / name
+        if path.exists() and path.is_file() and path not in candidates:
+            candidates.append(path)
+
+    return [str(path) for path in candidates]
 
 
 class QuantizationMethod(str, Enum):
@@ -414,6 +446,11 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
+        toml_sources = tuple(
+            TomlConfigSettingsSource(settings_cls, toml_file=path)
+            for path in _find_existing_config_files()
+        )
+
         return (
             init_settings,  # Used during resume - should override *all* other sources.
             CliSettingsSource(
@@ -425,5 +462,5 @@ class Settings(BaseSettings):
             EnvSettingsSource(settings_cls, env_prefix="HERETIC_"),
             dotenv_settings,
             file_secret_settings,
-            TomlConfigSettingsSource(settings_cls, toml_file="config.toml"),
+            *toml_sources,
         )
