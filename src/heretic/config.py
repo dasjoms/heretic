@@ -15,6 +15,10 @@ from pydantic_settings import (
 )
 
 
+def _bundled_prompt_file_path(name: str) -> str:
+    return str(Path(__file__).resolve().parent / "prompts" / name)
+
+
 def _find_existing_config_files() -> list[str]:
     """
     Returns candidate configuration files in precedence order.
@@ -410,9 +414,8 @@ class Settings(BaseSettings):
 
     bad_prompts: DatasetSpecification = Field(
         default=DatasetSpecification(
-            dataset="mlabonne/harmful_behaviors",
-            split="train[:400]",
-            column="text",
+            source_type=PromptSourceType.TEXT_FILE,
+            path=_bundled_prompt_file_path("bad.txt"),
             residual_plot_label='"Harmful" prompts',
             residual_plot_color="darkorange",
         ),
@@ -430,9 +433,8 @@ class Settings(BaseSettings):
 
     bad_evaluation_prompts: DatasetSpecification = Field(
         default=DatasetSpecification(
-            dataset="mlabonne/harmful_behaviors",
-            split="test[:100]",
-            column="text",
+            source_type=PromptSourceType.TEXT_FILE,
+            path=_bundled_prompt_file_path("bad_eval.txt"),
         ),
         description="Dataset of prompts that tend to result in refusals (used for evaluating model performance).",
     )
