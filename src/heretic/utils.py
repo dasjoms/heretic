@@ -286,7 +286,9 @@ def _load_text_file_prompts(specification: DatasetSpecification) -> list[str]:
 
     if specification.comment_prefix is not None:
         prompts = [
-            prompt for prompt in prompts if not prompt.lstrip().startswith(specification.comment_prefix)
+            prompt
+            for prompt in prompts
+            if not prompt.lstrip().startswith(specification.comment_prefix)
         ]
 
     if specification.skip_blank_lines:
@@ -300,10 +302,36 @@ def _load_text_file_prompts(specification: DatasetSpecification) -> list[str]:
     return prompts
 
 
+def print_prompt_source_diagnostics(specification: DatasetSpecification) -> None:
+    print("* Prompt source diagnostics:")
+    print(f"  * source_type: [bold]{specification.source_type.value}[/]")
+
+    if specification.source_type == PromptSourceType.DATASET:
+        print(f"  * dataset: [bold]{specification.dataset}[/]")
+        print(f"  * split: [bold]{specification.split}[/]")
+        print(f"  * column: [bold]{specification.column}[/]")
+    else:
+        source_path = (
+            Path(specification.path) if specification.path is not None else None
+        )
+        resolved = (
+            (Path.cwd() / source_path).resolve()
+            if source_path is not None and not source_path.is_absolute()
+            else source_path
+        )
+        print(f"  * configured path: [bold]{specification.path}[/]")
+        print(f"  * resolved path: [bold]{resolved}[/]")
+        if resolved is not None:
+            print(
+                f"  * exists: [bold]{resolved.exists()}[/], is_file: [bold]{resolved.is_file()}[/]"
+            )
+
+
 def load_prompts(
     settings: Settings,
     specification: DatasetSpecification,
 ) -> list[Prompt]:
+    print_prompt_source_diagnostics(specification)
     _validate_source_options(specification)
 
     if specification.source_type == PromptSourceType.TEXT_FILE:

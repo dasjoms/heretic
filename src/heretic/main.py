@@ -36,7 +36,7 @@ from questionary import Choice
 from rich.traceback import install
 
 from .analyzer import Analyzer
-from .config import QuantizationMethod, Settings
+from .config import QuantizationMethod, Settings, get_configuration_diagnostics
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
 from .utils import (
@@ -52,6 +52,92 @@ from .utils import (
     prompt_select,
     prompt_text,
 )
+
+
+def print_settings_diagnostics(settings: Settings) -> None:
+    print()
+    print("Configuration diagnostics:")
+
+    diagnostics = get_configuration_diagnostics()
+    candidate_files = diagnostics["candidate_files"]
+
+    if candidate_files:
+        print("* Discovered config files (highest precedence first):")
+        for path in candidate_files:
+            print(f"  * [bold]{path}[/]")
+    else:
+        print("* No config.toml/config.default.toml files discovered.")
+
+    for detail in diagnostics["details"]:
+        if "error" in detail:
+            print(
+                f"* [yellow]Could not parse[/] [bold]{detail['path']}[/]: {detail['error']}"
+            )
+
+    print("* Final resolved prompt source settings:")
+
+    prompt_groups = [
+        ("good_prompts", settings.good_prompts),
+        ("bad_prompts", settings.bad_prompts),
+        ("good_evaluation_prompts", settings.good_evaluation_prompts),
+        ("bad_evaluation_prompts", settings.bad_evaluation_prompts),
+    ]
+
+    for group_name, specification in prompt_groups:
+        print(
+            f"  * {group_name}: source_type=[bold]{specification.source_type.value}[/]"
+        )
+        if specification.source_type.value == "dataset":
+            print(
+                f"    dataset=[bold]{specification.dataset}[/], split=[bold]{specification.split}[/], column=[bold]{specification.column}[/]"
+            )
+        else:
+            path_display = (
+                specification.path if specification.path is not None else "<unset>"
+            )
+            print(f"    path=[bold]{path_display}[/]")
+
+
+def print_checkpoint_settings_diagnostics(
+    current_settings: Settings,
+    checkpoint_settings: Settings,
+    checkpoint_file: str,
+) -> None:
+    print()
+    print(f"Checkpoint diagnostics for [bold]{checkpoint_file}[/]:")
+
+    groups = [
+        "good_prompts",
+        "bad_prompts",
+        "good_evaluation_prompts",
+        "bad_evaluation_prompts",
+    ]
+
+    for name in groups:
+        current_spec = getattr(current_settings, name)
+        checkpoint_spec = getattr(checkpoint_settings, name)
+
+        current_label = (
+            current_spec.path
+            if current_spec.source_type.value == "text_file"
+            else current_spec.dataset
+        )
+        checkpoint_label = (
+            checkpoint_spec.path
+            if checkpoint_spec.source_type.value == "text_file"
+            else checkpoint_spec.dataset
+        )
+
+        changed = (
+            current_spec.source_type != checkpoint_spec.source_type
+            or current_label != checkpoint_label
+        )
+        marker = "[yellow]DIFF[/]" if changed else "same"
+
+        print(
+            f"* {name}: current=[bold]{current_spec.source_type.value}[/] ({current_label}) | "
+            f"checkpoint=[bold]{checkpoint_spec.source_type.value}[/] ({checkpoint_label}) -> {marker}"
+        )
 
 
 def obtain_merge_strategy(settings: Settings) -> str | None:
@@ -171,6 +257,8 @@ def run():
         )
         return
 
+    print_settings_diagnostics(settings)
+
     # Adapted from https://github.com/huggingface/accelerate/blob/main/src/accelerate/commands/env.py
     if torch.cuda.is_available():
         count = torch.cuda.device_count()
@@ -246,9 +334,17 @@ def run():
         existing_study = None
 
     if existing_study is not None and settings.evaluate_model is None:
-        saved_settings = Settings.model_validate_json(existing_study.user_attrs["settings"])
+        saved_settings = Settings.model_validate_json(
+            existing_study.user_attrs["settings"]
+        )
         settings_changed = saved_settings.model_dump() != settings.model_dump()
         choices = []
+
+        print_checkpoint_settings_diagnostics(
+            settings,
+            saved_settings,
+            study_checkpoint_file,
+        )
 
         if existing_study.user_attrs["finished"]:
             print()
@@ -328,6 +424,7 @@ def run():
             print(
                 "[yellow]Resuming with checkpoint settings. Current configuration was overridden.[/]"
             )
+            print_settings_diagnostics(settings)
         elif choice == "restart":
             os.unlink(study_checkpoint_file)
             backend = JournalFileBackend(study_checkpoint_file, lock_obj=lock_obj)
@@ -340,7 +437,9 @@ def run():
     print_memory_usage()
 
     print()
-    print(f"Loading good prompts from [bold]{settings.good_prompts.source_label()}[/]...")
+    print(
+        f"Loading good prompts from [bold]{settings.good_prompts.source_label()}[/]..."
+    )
     good_prompts = load_prompts(settings, settings.good_prompts)
     print(f"* [bold]{len(good_prompts)}[/] prompts loaded")
 
