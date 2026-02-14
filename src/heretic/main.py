@@ -314,12 +314,12 @@ def run():
     print_memory_usage()
 
     print()
-    print(f"Loading good prompts from [bold]{settings.good_prompts.dataset}[/]...")
+    print(f"Loading good prompts from [bold]{settings.good_prompts.source_label()}[/]...")
     good_prompts = load_prompts(settings, settings.good_prompts)
     print(f"* [bold]{len(good_prompts)}[/] prompts loaded")
 
     print()
-    print(f"Loading bad prompts from [bold]{settings.bad_prompts.dataset}[/]...")
+    print(f"Loading bad prompts from [bold]{settings.bad_prompts.source_label()}[/]...")
     bad_prompts = load_prompts(settings, settings.bad_prompts)
     print(f"* [bold]{len(bad_prompts)}[/] prompts loaded")
 

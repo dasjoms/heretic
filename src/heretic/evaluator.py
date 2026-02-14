@@ -23,7 +23,7 @@ class Evaluator:
 
         print()
         print(
-            f"Loading good evaluation prompts from [bold]{settings.good_evaluation_prompts.dataset}[/]..."
+            f"Loading good evaluation prompts from [bold]{settings.good_evaluation_prompts.source_label()}[/]..."
         )
         self.good_prompts = load_prompts(settings, settings.good_evaluation_prompts)
         print(f"* [bold]{len(self.good_prompts)}[/] prompts loaded")
@@ -33,7 +33,7 @@ class Evaluator:
 
         print()
         print(
-            f"Loading bad evaluation prompts from [bold]{settings.bad_evaluation_prompts.dataset}[/]..."
+            f"Loading bad evaluation prompts from [bold]{settings.bad_evaluation_prompts.source_label()}[/]..."
         )
         self.bad_prompts = load_prompts(settings, settings.bad_evaluation_prompts)
         print(f"* [bold]{len(self.bad_prompts)}[/] prompts loaded")

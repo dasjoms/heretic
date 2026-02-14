@@ -4,7 +4,7 @@
 from enum import Enum
 from typing import Dict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import (
     BaseSettings,
     CliSettingsSource,
@@ -26,14 +26,60 @@ class RowNormalization(str, Enum):
     FULL = "full"
 
 
+class PromptSourceType(str, Enum):
+    DATASET = "dataset"
+    TEXT_FILE = "text_file"
+
+
 class DatasetSpecification(BaseModel):
-    dataset: str = Field(
-        description="Hugging Face dataset ID, or path to dataset on disk."
+    source_type: PromptSourceType = Field(
+        default=PromptSourceType.DATASET,
+        description='Prompt source type. Options: "dataset" or "text_file".',
     )
 
-    split: str = Field(description="Portion of the dataset to use.")
+    dataset: str | None = Field(
+        default=None,
+        description="Hugging Face dataset ID, or path to dataset on disk.",
+    )
 
-    column: str = Field(description="Column in the dataset that contains the prompts.")
+    split: str | None = Field(default=None, description="Portion of the dataset to use.")
+
+    column: str | None = Field(
+        default=None,
+        description="Column in the dataset that contains the prompts.",
+    )
+
+    path: str | None = Field(
+        default=None,
+        description="Path to text file with one prompt per line.",
+    )
+
+    encoding: str = Field(
+        default="utf-8",
+        description="Text file encoding.",
+    )
+
+    skip_blank_lines: bool = Field(
+        default=True,
+        description="Whether to skip blank lines when loading prompts from text files.",
+    )
+
+    comment_prefix: str | None = Field(
+        default=None,
+        description="Prefix identifying comment lines to ignore in text files.",
+    )
+
+    max_prompts: int | None = Field(
+        default=None,
+        ge=0,
+        description="Maximum number of prompts to load from text files.",
+    )
+
+    start_index: int = Field(
+        default=0,
+        ge=0,
+        description="Start index to apply when slicing prompts loaded from text files.",
+    )
 
     prefix: str = Field(
         default="",
@@ -59,6 +105,47 @@ class DatasetSpecification(BaseModel):
         default=None,
         description="Matplotlib color to use for the dataset in plots of residual vectors.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_legacy_defaults(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+
+        if "source_type" not in data:
+            if "path" in data:
+                data["source_type"] = PromptSourceType.TEXT_FILE
+            else:
+                data["source_type"] = PromptSourceType.DATASET
+
+        if data["source_type"] == PromptSourceType.DATASET:
+            data.setdefault("split", "train")
+            data.setdefault("column", "text")
+
+        return data
+
+    @model_validator(mode="after")
+    def validate_by_source_type(self):
+        if self.source_type == PromptSourceType.DATASET:
+            if self.dataset is None:
+                raise ValueError("dataset must be set when source_type is 'dataset'")
+            if self.split is None:
+                raise ValueError("split must be set when source_type is 'dataset'")
+            if self.column is None:
+                raise ValueError("column must be set when source_type is 'dataset'")
+        elif self.source_type == PromptSourceType.TEXT_FILE:
+            if self.path is None:
+                raise ValueError("path must be set when source_type is 'text_file'")
+
+        return self
+
+    def source_label(self) -> str:
+        if self.source_type == PromptSourceType.TEXT_FILE:
+            assert self.path is not None
+            return self.path
+
+        assert self.dataset is not None
+        return self.dataset
 
 
 class Settings(BaseSettings):

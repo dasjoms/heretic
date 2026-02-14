@@ -26,7 +26,7 @@ from psutil import Process
 from questionary import Choice, Style
 from rich.console import Console
 
-from .config import DatasetSpecification, Settings
+from .config import DatasetSpecification, PromptSourceType, Settings
 
 print = Console(highlight=False).print
 
@@ -160,10 +160,11 @@ class Prompt:
     user: str
 
 
-def load_prompts(
-    settings: Settings,
-    specification: DatasetSpecification,
-) -> list[Prompt]:
+def _load_dataset_prompts(specification: DatasetSpecification) -> list[str]:
+    assert specification.dataset is not None
+    assert specification.split is not None
+    assert specification.column is not None
+
     path = specification.dataset
     split_str = specification.split
 
@@ -198,7 +199,43 @@ def load_prompts(
         # Probably a repository path; let load_dataset figure it out.
         dataset = load_dataset(path, split=split_str)
 
-    prompts = list(dataset[specification.column])
+    return list(dataset[specification.column])
+
+
+def _load_text_file_prompts(specification: DatasetSpecification) -> list[str]:
+    assert specification.path is not None
+
+    source_path = Path(specification.path)
+    if not source_path.is_absolute():
+        source_path = Path.cwd() / source_path
+
+    with source_path.open(encoding=specification.encoding) as file:
+        prompts = file.read().splitlines()
+
+    if specification.comment_prefix is not None:
+        prompts = [
+            prompt for prompt in prompts if not prompt.lstrip().startswith(specification.comment_prefix)
+        ]
+
+    if specification.skip_blank_lines:
+        prompts = [prompt for prompt in prompts if prompt.strip()]
+
+    prompts = prompts[specification.start_index :]
+
+    if specification.max_prompts is not None:
+        prompts = prompts[: specification.max_prompts]
+
+    return prompts
+
+
+def load_prompts(
+    settings: Settings,
+    specification: DatasetSpecification,
+) -> list[Prompt]:
+    if specification.source_type == PromptSourceType.TEXT_FILE:
+        prompts = _load_text_file_prompts(specification)
+    else:
+        prompts = _load_dataset_prompts(specification)
 
     if specification.prefix:
         prompts = [f"{specification.prefix} {prompt}" for prompt in prompts]
