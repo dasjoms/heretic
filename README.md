@@ -92,6 +92,36 @@ greater control. Run `heretic --help` to see available command-line options,
 or look at [`config.default.toml`](config.default.toml) if you prefer to use
 a configuration file.
 
+### Using local text prompt files
+
+You can provide prompt sources from local text files instead of Hugging Face datasets.
+Each file must contain **one prompt per line**.
+
+Place prompt files in your repository/work directory (for example, `prompts/`), then wire
+all four prompt groups in your config. You can copy starter files from
+[`examples/prompts/`](examples/prompts/):
+
+```toml
+[good_prompts]
+source_type = "text_file"
+path = "prompts/good.txt"
+
+[bad_prompts]
+source_type = "text_file"
+path = "prompts/bad.txt"
+
+[good_evaluation_prompts]
+source_type = "text_file"
+path = "prompts/good_eval.txt"
+
+[bad_evaluation_prompts]
+source_type = "text_file"
+path = "prompts/bad_eval.txt"
+```
+
+Global and per-group prompt shaping still applies when using text files, including
+`prefix`, `suffix`, and `system_prompt`.
+
 At the start of a program run, Heretic benchmarks the system to determine
 the optimal batch size to make the most of the available hardware.
 On an RTX 3090, with the default configuration, decensoring Llama-3.1-8B-Instruct
