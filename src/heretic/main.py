@@ -32,7 +32,7 @@ from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
 from optuna.study import StudyDirection
-from optuna.trial import TrialState
+from optuna.trial import FrozenTrial, TrialState
 from pydantic import ValidationError
 from questionary import Choice
 from rich.traceback import install
@@ -866,30 +866,13 @@ def run():
     ) -> tuple[float | None, dict[str, AbliterationParameters], Trial | None]:
         nonlocal refusal_directions
 
-        def prompt_optional_float(prompt: str) -> float | None:
-            while True:
-                value = prompt_text(prompt)
-                if value is None or value == "":
-                    return None
-                try:
-                    return float(value)
-                except ValueError:
-                    print("[red]Please enter a number, or leave blank to skip.[/]")
-
-        def prompt_optional_int(prompt: str) -> int | None:
-            while True:
-                value = prompt_text(prompt)
-                if value is None or value == "":
-                    return None
-                try:
-                    return int(value)
-                except ValueError:
-                    print("[red]Please enter a whole number, or leave blank to skip.[/]")
-
         policy_mode = settings.policy_refusal_directions_mode
         refresh_interval = settings.policy_refusal_directions_refresh_interval
         if policy_mode != "periodic":
             refresh_interval = None
+
+        policy_trials_per_iteration = settings.policy_n_trials
+        policy_iterations = settings.policy_optimization_iterations
 
         def refresh_refusal_directions(reason: str) -> None:
             nonlocal refusal_directions
@@ -905,24 +888,44 @@ def run():
                 "* Refusal directions updated. KL/refusal scoring baseline remains fixed to the original model."
             )
 
-        while True:
-            try:
-                n_trials = prompt_text(
-                    "How many policy optimization trials do you want to run?",
-                )
-                if n_trials is None or n_trials == "":
-                    return seed_direction_index, seed_parameters, None
-                n_trials = int(n_trials)
-                if n_trials > 0:
-                    break
-                print("[red]Please enter a number greater than 0.[/]")
-            except ValueError:
-                print("[red]Please enter a number.[/]")
+        def clone_parameters(
+            parameters: dict[str, AbliterationParameters],
+        ) -> dict[str, AbliterationParameters]:
+            return {
+                component: AbliterationParameters(**asdict(component_parameters))
+                for component, component_parameters in parameters.items()
+            }
+
+        def is_trial_better(candidate: Trial, incumbent: Trial) -> bool:
+            candidate_pair = (
+                candidate.user_attrs["refusals"],
+                candidate.user_attrs["kl_divergence"],
+            )
+            incumbent_pair = (
+                incumbent.user_attrs["refusals"],
+                incumbent.user_attrs["kl_divergence"],
+            )
+            return candidate_pair < incumbent_pair
+
+        def get_sampling_configuration(iteration_index: int) -> tuple[dict[str, float], float]:
+            local_scale = max(settings.policy_local_perturbation_scale, 1e-4)
+            iteration_decay = max(0.4, 1.0 - (0.18 * iteration_index))
+            effective_scale = max(local_scale * iteration_decay, local_scale * 0.35)
+            policy_sampling_radius = {
+                "direction_index": max(1.0, effective_scale * last_layer_index),
+                "max_weight": max(0.04, effective_scale * 0.7),
+                "max_weight_position": max(1.0, effective_scale * last_layer_index),
+                "min_weight": max(0.04, effective_scale * 0.7),
+                "min_weight_distance": max(1.0, effective_scale * last_layer_index),
+            }
+            policy_global_exploration_probability = min(0.35, 0.12 + (effective_scale * 0.8))
+            return policy_sampling_radius, policy_global_exploration_probability
 
         print()
         print("[bold]Running policy optimization from selected trial...[/]")
         print("* Re-initializing evaluation baseline from unedited model...")
         evaluator.initialize_baseline()
+
         if policy_mode in ["recompute", "periodic"]:
             refresh_refusal_directions(
                 "Recomputing refusal directions before policy optimization"
@@ -931,366 +934,348 @@ def run():
                 print(
                     "* Policy periodic refresh interval is not set; using only the initial policy-phase recomputation."
                 )
-        print("* Evaluating seed policy...")
-        model.reset_model()
-        model.abliterate(
-            refusal_directions,
-            seed_direction_index,
-            seed_parameters,
-            require_reset=True,
-        )
-        _, seed_kl, seed_refusals = evaluator.get_score()
-        print(
-            "* Seed policy metrics: "
-            f"Refusals {seed_refusals:>2}/{len(evaluator.bad_prompts)}, "
-            f"KL divergence {seed_kl:.4f}"
-        )
 
-        print("* Optional hard constraints (leave blank to disable):")
-        kl_ceiling = prompt_optional_float("Maximum KL divergence")
-        refusal_improvement_delta = prompt_optional_int(
-            "Minimum refusal reduction vs seed (e.g., 1 means refusal <= seed - 1)"
-        )
-
-        seed_policy_fingerprint = {
-            "direction_index": seed_direction_index,
-            "parameters": {
-                component: asdict(component_parameters)
-                for component, component_parameters in sorted(seed_parameters.items())
-            },
-        }
-        seed_policy_hash = hashlib.sha256(
-            json.dumps(seed_policy_fingerprint, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:12]
-        seed_tag = (
-            f"trial-{seed_trial_index}"
-            if seed_trial_index is not None
-            else f"policy-{seed_policy_hash}"
-        )
-
-        policy_study_checkpoint_file = os.path.join(
-            settings.study_checkpoint_dir,
-            "--".join(
-                [
-                    sanitize_checkpoint_component(settings.model),
-                    "policy-opt",
-                    sanitize_checkpoint_component(seed_tag),
-                ]
-            )
-            + ".jsonl",
-        )
-        policy_lock_obj = JournalFileOpenLock(policy_study_checkpoint_file)
-        policy_backend = JournalFileBackend(
-            policy_study_checkpoint_file,
-            lock_obj=policy_lock_obj,
-        )
-        policy_storage = JournalStorage(policy_backend)
-
-        policy_sampling_radius = {
-            "direction_index": 2.0,
-            "max_weight": 0.2,
-            "max_weight_position": 2.0,
-            "min_weight": 0.2,
-            "min_weight_distance": 2.0,
-        }
-        policy_global_exploration_probability = 0.15
-
-        seed_policy = {
-            "direction_index": seed_direction_index,
-            "seed_refusals": seed_refusals,
-            "seed_kl": seed_kl,
-            "parameters": {
-                component: asdict(component_parameters)
-                for component, component_parameters in sorted(seed_parameters.items())
-            },
-        }
-
-        policy_study = optuna.create_study(
-            sampler=TPESampler(
-                n_startup_trials=min(settings.n_startup_trials, n_trials),
-                n_ei_candidates=128,
-                multivariate=True,
-            ),
-            directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
-            storage=policy_storage,
-            study_name="heretic-policy-opt",
-            load_if_exists=True,
-        )
-        policy_study.set_user_attr("seed_policy", seed_policy)
-        policy_study.set_user_attr("constraints", {
-            "kl_ceiling": kl_ceiling,
-            "refusal_improvement_delta": refusal_improvement_delta,
-        })
-
-        policy_trial_count = 0
-
-        def policy_objective(policy_trial: Trial) -> tuple[float, float]:
-            nonlocal policy_trial_count
-            if (
-                policy_mode == "periodic"
-                and refresh_interval is not None
-                and refresh_interval > 0
-                and policy_trial_count > 0
-                and policy_trial_count % refresh_interval == 0
-            ):
-                refresh_refusal_directions(
-                    f"Periodic refusal-direction refresh before policy trial {policy_trial.number}"
-                )
-
-            direction_scope = sample_direction_scope(policy_trial)
-
-            direction_index = sample_direction_index(
-                policy_trial,
-                direction_scope,
-                seed_direction_index=seed_direction_index,
-                radius=policy_sampling_radius["direction_index"],
-                global_exploration_probability=policy_global_exploration_probability,
-            )
-
-            parameters = {}
-            deltas = {
-                "direction_index": (
-                    None
-                    if direction_index is None or seed_direction_index is None
-                    else direction_index - seed_direction_index
-                ),
-                "parameters": {},
-            }
-
-            for component in model.get_abliterable_components():
-                component_parameters = sample_component_parameters(
-                    policy_trial,
-                    component,
-                    seed_parameters=seed_parameters[component],
-                    radius={
-                        "max_weight": policy_sampling_radius["max_weight"],
-                        "max_weight_position": policy_sampling_radius[
-                            "max_weight_position"
-                        ],
-                        "min_weight": policy_sampling_radius["min_weight"],
-                        "min_weight_distance": policy_sampling_radius[
-                            "min_weight_distance"
-                        ],
-                    },
-                    global_exploration_probability=policy_global_exploration_probability,
-                )
-                parameters[component] = component_parameters
-
-                seed_component = seed_parameters[component]
-                deltas["parameters"][component] = {
-                    "max_weight": (
-                        component_parameters.max_weight - seed_component.max_weight
-                    ),
-                    "max_weight_position": (
-                        component_parameters.max_weight_position
-                        - seed_component.max_weight_position
-                    ),
-                    "min_weight": (
-                        component_parameters.min_weight - seed_component.min_weight
-                    ),
-                    "min_weight_distance": (
-                        component_parameters.min_weight_distance
-                        - seed_component.min_weight_distance
-                    ),
-                }
-
-            policy_trial.set_user_attr("direction_index", direction_index)
-            policy_trial.set_user_attr(
-                "parameters", {k: asdict(v) for k, v in parameters.items()}
-            )
-            policy_trial.set_user_attr("seed_policy", seed_policy)
-            policy_trial.set_user_attr("candidate_deltas", deltas)
-            policy_trial.set_user_attr("seed_refusals", seed_refusals)
-            policy_trial.set_user_attr("seed_kl", seed_kl)
-            policy_trial.set_user_attr("policy_run_id", seed_tag)
-            policy_trial.set_user_attr(
-                "policy_checkpoint_file",
-                policy_study_checkpoint_file,
-            )
-
-            print("* Resetting model...")
+        def evaluate_seed_policy(
+            direction_index: float | None,
+            parameters: dict[str, AbliterationParameters],
+        ) -> tuple[float, int]:
+            print("* Evaluating seed policy...")
             model.reset_model()
-            if settings.verbose:
-                print("[grey50][debug] Policy evaluation model reset completed.[/]")
-            print("* Abliterating...")
-            if settings.verbose:
-                debug_parameters = {k: asdict(v) for k, v in parameters.items()}
-                print(
-                    f"[grey50][debug] Applying candidate policy parameters: direction_index={direction_index}, parameters={debug_parameters}[/]"
-                )
             model.abliterate(
                 refusal_directions,
                 direction_index,
                 parameters,
                 require_reset=True,
             )
-            print("* Evaluating...")
-            if settings.verbose:
-                print("[grey50][debug] Policy evaluation started.[/]")
-            score, kl_divergence, refusals = evaluator.get_score()
-
-            policy_trial.set_user_attr("kl_divergence", kl_divergence)
-            policy_trial.set_user_attr("refusals", refusals)
-            policy_trial.set_user_attr("refusal_change", refusals - seed_refusals)
-            policy_trial.set_user_attr("kl_change", kl_divergence - seed_kl)
-
-            accepted = True
-            if kl_ceiling is not None and kl_divergence > kl_ceiling:
-                accepted = False
-            if refusal_improvement_delta is not None and (
-                refusals > seed_refusals - refusal_improvement_delta
-            ):
-                accepted = False
-            policy_trial.set_user_attr("accepted", accepted)
-            policy_trial_count += 1
-
-            return score
-
-        seed_trial_params = {
-            "direction_scope": (
-                "global" if seed_direction_index is not None else "per layer"
-            ),
-            "direction_index": (
-                seed_direction_index
-                if seed_direction_index is not None
-                else 0.65 * last_layer_index
-            ),
-        }
-        for component, component_parameters in seed_parameters.items():
-            seed_trial_params[f"{component}.max_weight"] = component_parameters.max_weight
-            seed_trial_params[f"{component}.max_weight_position"] = (
-                component_parameters.max_weight_position
-            )
-            seed_trial_params[f"{component}.min_weight"] = component_parameters.min_weight
-            seed_trial_params[f"{component}.min_weight_distance"] = (
-                component_parameters.min_weight_distance
-            )
-
-        policy_study.enqueue_trial(seed_trial_params)
-        policy_study.optimize(policy_objective, n_trials=n_trials)
-
-        completed_trials = [
-            t for t in policy_study.trials if t.state == TrialState.COMPLETE
-        ]
-        if not completed_trials:
-            return seed_direction_index, seed_parameters, None
-
-        accepted_trials = [
-            t for t in completed_trials if t.user_attrs.get("accepted", True)
-        ]
-        candidate_pool = accepted_trials if accepted_trials else completed_trials
-
-        sorted_trials = sorted(
-            candidate_pool,
-            key=lambda trial: (
-                trial.user_attrs["refusals"],
-                trial.user_attrs["kl_divergence"],
-            ),
-        )
-        min_divergence = math.inf
-        pareto_trials = []
-        for trial in sorted_trials:
-            kl_divergence = trial.user_attrs["kl_divergence"]
-            if kl_divergence < min_divergence:
-                min_divergence = kl_divergence
-                pareto_trials.append(trial)
-
-        best_policy_trial = min(
-            candidate_pool,
-            key=lambda t: (
-                t.user_attrs["refusals"],
-                t.user_attrs["kl_divergence"],
-            ),
-        )
-        lowest_kl_trial = min(candidate_pool, key=lambda t: t.user_attrs["kl_divergence"])
-
-        def signed_number(value: float, digits: int = 4) -> str:
-            return f"{value:+.{digits}f}"
-
-        print()
-        print("Policy Pareto front (changes shown vs seed policy):")
-        print(
-            f"* Seed policy: Refusals {seed_refusals:>2}/{len(evaluator.bad_prompts)}, "
-            f"KL divergence {seed_kl:.4f}"
-        )
-        if kl_ceiling is not None or refusal_improvement_delta is not None:
-            print("* Active hard constraints:")
-            if kl_ceiling is not None:
-                print(f"  * KL divergence <= [bold]{kl_ceiling:.4f}[/]")
-            if refusal_improvement_delta is not None:
-                print(
-                    "  * Refusals <= [bold]"
-                    f"{seed_refusals - refusal_improvement_delta}[/] "
-                    f"(seed {seed_refusals} - {refusal_improvement_delta})"
-                )
-        if not accepted_trials:
+            _, seed_kl, seed_refusals = evaluator.get_score()
             print(
-                "[yellow]No candidates satisfied the hard constraints. "
-                "Showing Pareto front across all policy trials.[/]"
+                "* Seed policy metrics: "
+                f"Refusals {seed_refusals:>2}/{len(evaluator.bad_prompts)}, "
+                f"KL divergence {seed_kl:.4f}"
+            )
+            return seed_kl, seed_refusals
+
+        base_checkpoint_dir = settings.policy_checkpoint_dir or settings.study_checkpoint_dir
+        os.makedirs(base_checkpoint_dir, exist_ok=True)
+
+        active_direction_index = seed_direction_index
+        active_parameters = clone_parameters(seed_parameters)
+        active_trial = None
+
+        for iteration in range(policy_iterations):
+            print()
+            print(
+                f"[bold]Policy optimization iteration {iteration + 1}/{policy_iterations}[/]"
+            )
+            seed_kl, seed_refusals = evaluate_seed_policy(
+                active_direction_index,
+                active_parameters,
             )
 
-        choices = []
-        for trial in pareto_trials:
-            refusal_change = trial.user_attrs.get(
-                "refusal_change",
-                trial.user_attrs["refusals"] - seed_refusals,
-            )
-            kl_change = trial.user_attrs.get(
-                "kl_change",
-                trial.user_attrs["kl_divergence"] - seed_kl,
-            )
-            marker = "[green]✓ accepted[/]" if trial.user_attrs.get("accepted", True) else "[red]✗ rejected[/]"
-            highlight = ""
-            if trial.number == best_policy_trial.number:
-                highlight += " [bold green]★ best quality[/]"
-            if trial.number == lowest_kl_trial.number:
-                highlight += " [bold cyan]★ lowest KL[/]"
-
-            choices.append(
-                Choice(
-                    title=(
-                        f"[Trial {trial.number:>3}] "
-                        f"Refusals {trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)} "
-                        f"(Δ {signed_number(refusal_change, 0)}), "
-                        f"KL {trial.user_attrs['kl_divergence']:.4f} "
-                        f"(Δ {signed_number(kl_change)}) - {marker}{highlight}"
-                    ),
-                    value=trial,
+            kl_ceiling = settings.policy_hard_kl_ceiling
+            refusal_improvement_delta = None
+            if settings.policy_min_refusal_improvement is not None:
+                refusal_improvement_delta = math.ceil(
+                    settings.policy_min_refusal_improvement * len(evaluator.bad_prompts)
                 )
+
+            if kl_ceiling is not None or refusal_improvement_delta is not None:
+                print("* Active hard constraints:")
+                if kl_ceiling is not None:
+                    print(f"  * KL divergence <= [bold]{kl_ceiling:.4f}[/]")
+                if refusal_improvement_delta is not None:
+                    print(
+                        "  * Refusals <= [bold]"
+                        f"{seed_refusals - refusal_improvement_delta}[/] "
+                        f"(seed {seed_refusals} - {refusal_improvement_delta})"
+                    )
+
+            seed_policy_fingerprint = {
+                "direction_index": active_direction_index,
+                "parameters": {
+                    component: asdict(component_parameters)
+                    for component, component_parameters in sorted(active_parameters.items())
+                },
+                "iteration": iteration,
+            }
+            seed_policy_hash = hashlib.sha256(
+                json.dumps(seed_policy_fingerprint, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+            seed_tag = (
+                f"trial-{seed_trial_index}-iter-{iteration + 1}"
+                if seed_trial_index is not None
+                else f"policy-{seed_policy_hash}"
             )
 
-        choices.append(Choice(title="Cancel policy selection", value=""))
-        selected_policy_trial = prompt_select(
-            "Select a policy trial to load for save/upload/chat", choices
-        )
-        if selected_policy_trial is None or selected_policy_trial == "":
-            return seed_direction_index, seed_parameters, None
+            policy_study_checkpoint_file = os.path.join(
+                base_checkpoint_dir,
+                "--".join(
+                    [
+                        sanitize_checkpoint_component(settings.model),
+                        "policy-opt",
+                        sanitize_checkpoint_component(seed_tag),
+                    ]
+                )
+                + ".jsonl",
+            )
+            policy_lock_obj = JournalFileOpenLock(policy_study_checkpoint_file)
+            policy_backend = JournalFileBackend(
+                policy_study_checkpoint_file,
+                lock_obj=policy_lock_obj,
+            )
+            policy_storage = JournalStorage(policy_backend)
 
-        best_policy_trial = selected_policy_trial
-        best_direction_index = best_policy_trial.user_attrs["direction_index"]
-        best_parameters = {
-            k: AbliterationParameters(**v)
-            for k, v in best_policy_trial.user_attrs["parameters"].items()
-        }
+            policy_sampling_radius, policy_global_exploration_probability = (
+                get_sampling_configuration(iteration)
+            )
+
+            seed_policy = {
+                "direction_index": active_direction_index,
+                "seed_refusals": seed_refusals,
+                "seed_kl": seed_kl,
+                "parameters": {
+                    component: asdict(component_parameters)
+                    for component, component_parameters in sorted(active_parameters.items())
+                },
+            }
+
+            def policy_constraints(trial: FrozenTrial) -> tuple[float, float]:
+                if trial.state != TrialState.COMPLETE:
+                    return (0.0, 0.0)
+                refusal_violation = 0.0
+                if refusal_improvement_delta is not None:
+                    refusal_limit = seed_refusals - refusal_improvement_delta
+                    refusal_violation = max(0.0, trial.user_attrs["refusals"] - refusal_limit)
+                kl_violation = 0.0
+                if kl_ceiling is not None:
+                    kl_violation = max(0.0, trial.user_attrs["kl_divergence"] - kl_ceiling)
+                return (refusal_violation, kl_violation)
+
+            policy_study = optuna.create_study(
+                sampler=TPESampler(
+                    n_startup_trials=min(settings.n_startup_trials, policy_trials_per_iteration),
+                    n_ei_candidates=128,
+                    multivariate=True,
+                    constraints_func=policy_constraints,
+                ),
+                directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
+                storage=policy_storage,
+                study_name="heretic-policy-opt",
+                load_if_exists=True,
+            )
+            policy_study.set_user_attr("seed_policy", seed_policy)
+            policy_study.set_user_attr(
+                "constraints",
+                {
+                    "kl_ceiling": kl_ceiling,
+                    "refusal_improvement_delta": refusal_improvement_delta,
+                },
+            )
+
+            policy_trial_count = 0
+
+            def policy_objective(policy_trial: Trial) -> tuple[float, float]:
+                nonlocal policy_trial_count
+                if (
+                    policy_mode == "periodic"
+                    and refresh_interval is not None
+                    and refresh_interval > 0
+                    and policy_trial_count > 0
+                    and policy_trial_count % refresh_interval == 0
+                ):
+                    refresh_refusal_directions(
+                        f"Periodic refusal-direction refresh before policy trial {policy_trial.number}"
+                    )
+
+                direction_scope = sample_direction_scope(policy_trial)
+
+                direction_index = sample_direction_index(
+                    policy_trial,
+                    direction_scope,
+                    seed_direction_index=active_direction_index,
+                    radius=policy_sampling_radius["direction_index"],
+                    global_exploration_probability=policy_global_exploration_probability,
+                )
+
+                parameters = {}
+                deltas = {
+                    "direction_index": (
+                        None
+                        if direction_index is None or active_direction_index is None
+                        else direction_index - active_direction_index
+                    ),
+                    "parameters": {},
+                }
+
+                for component in model.get_abliterable_components():
+                    component_parameters = sample_component_parameters(
+                        policy_trial,
+                        component,
+                        seed_parameters=active_parameters[component],
+                        radius={
+                            "max_weight": policy_sampling_radius["max_weight"],
+                            "max_weight_position": policy_sampling_radius[
+                                "max_weight_position"
+                            ],
+                            "min_weight": policy_sampling_radius["min_weight"],
+                            "min_weight_distance": policy_sampling_radius[
+                                "min_weight_distance"
+                            ],
+                        },
+                        global_exploration_probability=policy_global_exploration_probability,
+                    )
+                    parameters[component] = component_parameters
+
+                    seed_component = active_parameters[component]
+                    deltas["parameters"][component] = {
+                        "max_weight": (
+                            component_parameters.max_weight - seed_component.max_weight
+                        ),
+                        "max_weight_position": (
+                            component_parameters.max_weight_position
+                            - seed_component.max_weight_position
+                        ),
+                        "min_weight": (
+                            component_parameters.min_weight - seed_component.min_weight
+                        ),
+                        "min_weight_distance": (
+                            component_parameters.min_weight_distance
+                            - seed_component.min_weight_distance
+                        ),
+                    }
+
+                policy_trial.set_user_attr("direction_index", direction_index)
+                policy_trial.set_user_attr(
+                    "parameters", {k: asdict(v) for k, v in parameters.items()}
+                )
+                policy_trial.set_user_attr("seed_policy", seed_policy)
+                policy_trial.set_user_attr("candidate_deltas", deltas)
+                policy_trial.set_user_attr("seed_refusals", seed_refusals)
+                policy_trial.set_user_attr("seed_kl", seed_kl)
+                policy_trial.set_user_attr("policy_run_id", seed_tag)
+                policy_trial.set_user_attr(
+                    "policy_checkpoint_file",
+                    policy_study_checkpoint_file,
+                )
+
+                print("* Resetting model...")
+                model.reset_model()
+                print("* Abliterating...")
+                model.abliterate(
+                    refusal_directions,
+                    direction_index,
+                    parameters,
+                    require_reset=True,
+                )
+                print("* Evaluating...")
+                score, kl_divergence, refusals = evaluator.get_score()
+
+                policy_trial.set_user_attr("kl_divergence", kl_divergence)
+                policy_trial.set_user_attr("refusals", refusals)
+                policy_trial.set_user_attr("refusal_change", refusals - seed_refusals)
+                policy_trial.set_user_attr("kl_change", kl_divergence - seed_kl)
+
+                accepted = True
+                if kl_ceiling is not None and kl_divergence > kl_ceiling:
+                    accepted = False
+                if refusal_improvement_delta is not None and (
+                    refusals > seed_refusals - refusal_improvement_delta
+                ):
+                    accepted = False
+                policy_trial.set_user_attr("accepted", accepted)
+                policy_trial_count += 1
+
+                return score
+
+            seed_trial_params = {
+                "direction_scope": (
+                    "global" if active_direction_index is not None else "per layer"
+                ),
+                "direction_index": (
+                    active_direction_index
+                    if active_direction_index is not None
+                    else 0.65 * last_layer_index
+                ),
+            }
+            for component, component_parameters in active_parameters.items():
+                seed_trial_params[f"{component}.max_weight"] = component_parameters.max_weight
+                seed_trial_params[f"{component}.max_weight_position"] = (
+                    component_parameters.max_weight_position
+                )
+                seed_trial_params[f"{component}.min_weight"] = component_parameters.min_weight
+                seed_trial_params[f"{component}.min_weight_distance"] = (
+                    component_parameters.min_weight_distance
+                )
+
+            policy_study.enqueue_trial(seed_trial_params)
+            policy_study.optimize(policy_objective, n_trials=policy_trials_per_iteration)
+
+            completed_trials = [
+                t for t in policy_study.trials if t.state == TrialState.COMPLETE
+            ]
+            if not completed_trials:
+                continue
+
+            accepted_trials = [
+                t for t in completed_trials if t.user_attrs.get("accepted", True)
+            ]
+            candidate_pool = accepted_trials if accepted_trials else completed_trials
+
+            best_policy_trial = min(
+                candidate_pool,
+                key=lambda t: (
+                    t.user_attrs["refusals"],
+                    t.user_attrs["kl_divergence"],
+                ),
+            )
+
+            print()
+            print("Policy optimization summary:")
+            print(
+                f"* Seed policy: Refusals {seed_refusals:>2}/{len(evaluator.bad_prompts)}, "
+                f"KL divergence {seed_kl:.4f}"
+            )
+            print(
+                "* Auto-selected best trial: "
+                f"[bold]{best_policy_trial.number}[/] "
+                f"(Refusals {best_policy_trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)}, "
+                f"KL {best_policy_trial.user_attrs['kl_divergence']:.4f}, "
+                f"Δrefusal {best_policy_trial.user_attrs['refusal_change']:+.0f}, "
+                f"ΔKL {best_policy_trial.user_attrs['kl_change']:+.4f})"
+            )
+
+            if active_trial is None or is_trial_better(best_policy_trial, active_trial):
+                active_trial = best_policy_trial
+                active_direction_index = best_policy_trial.user_attrs["direction_index"]
+                active_parameters = {
+                    k: AbliterationParameters(**v)
+                    for k, v in best_policy_trial.user_attrs["parameters"].items()
+                }
+                print("* Accepted as new policy seed for the next iteration.")
+            else:
+                print("* No improvement over current seed; retaining previous policy for stability.")
+
+        if active_trial is None:
+            return seed_direction_index, seed_parameters, None
 
         print()
         print(
             "Selected refined policy: "
-            f"Refusals {best_policy_trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)}, "
-            f"KL divergence {best_policy_trial.user_attrs['kl_divergence']:.4f}, "
-            f"Δrefusal {best_policy_trial.user_attrs['refusal_change']:+.0f}, "
-            f"ΔKL {best_policy_trial.user_attrs['kl_change']:+.4f}"
+            f"Refusals {active_trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)}, "
+            f"KL divergence {active_trial.user_attrs['kl_divergence']:.4f}, "
+            f"Δrefusal {active_trial.user_attrs['refusal_change']:+.0f}, "
+            f"ΔKL {active_trial.user_attrs['kl_change']:+.4f}"
         )
         print("* Loading selected refined policy...")
         model.reset_model()
         model.abliterate(
             refusal_directions,
-            best_direction_index,
-            best_parameters,
+            active_direction_index,
+            active_parameters,
             require_reset=True,
         )
 
-        return best_direction_index, best_parameters, best_policy_trial
+        return active_direction_index, active_parameters, active_trial
 
     def compare_seed_vs_refined_policy(
         seed_direction_index: float | None,
@@ -1553,6 +1538,29 @@ def run():
                 active_parameters,
                 require_reset=True,
             )
+
+            if settings.policy_optimization_enabled:
+                print()
+                print("[bold]Policy optimization is enabled in config; starting automatic refinement...[/]")
+                seed_direction_index = active_direction_index
+                seed_parameters = {
+                    component: component_parameters
+                    for component, component_parameters in active_parameters.items()
+                }
+                (
+                    active_direction_index,
+                    active_parameters,
+                    refined_policy_trial,
+                ) = optimize_policy_from_seed(
+                    active_direction_index,
+                    active_parameters,
+                    active_trial.user_attrs.get("index"),
+                )
+                if refined_policy_trial is not None:
+                    comparison_seed_trial_index = active_trial.user_attrs.get("index")
+                    active_trial = refined_policy_trial
+                    comparison_seed_direction_index = seed_direction_index
+                    comparison_seed_parameters = seed_parameters
 
             while True:
                 print()

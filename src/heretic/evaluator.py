@@ -119,10 +119,11 @@ class Evaluator:
 
         refusals_score = refusals / self.base_refusals
 
-        if kl_divergence >= kl_divergence_target:
-            kld_score = kl_divergence / kl_divergence_scale
-        else:
-            kld_score = refusals_score * kl_divergence_target / kl_divergence_scale
+        normalized_kl = kl_divergence / kl_divergence_scale
+        # Keep a strict incentive to lower KL everywhere, while still applying
+        # extra pressure when we're above the target region.
+        target_excess = max(0.0, kl_divergence - kl_divergence_target)
+        kld_score = normalized_kl + (target_excess / kl_divergence_scale)
 
         score = (
             kld_score,

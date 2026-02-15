@@ -100,6 +100,9 @@ policy_optimization_enabled = false
 # Number of policy optimization trials to run.
 policy_n_trials = 40
 
+# Number of sequential policy optimization refinement passes to run.
+policy_optimization_iterations = 1
+
 # Scale of local perturbations around the seed policy during policy optimization.
 policy_local_perturbation_scale = 0.03
 
