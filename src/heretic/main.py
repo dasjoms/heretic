@@ -3,6 +3,8 @@
 
 import math
 import os
+import hashlib
+import json
 import sys
 import time
 import warnings
@@ -316,12 +318,14 @@ def run():
 
     os.makedirs(settings.study_checkpoint_dir, exist_ok=True)
 
+    def sanitize_checkpoint_component(value: str) -> str:
+        return "".join(
+            [(c if (c.isalnum() or c in ["_", "-"]) else "--") for c in value]
+        )
+
     study_checkpoint_file = os.path.join(
         settings.study_checkpoint_dir,
-        "".join(
-            [(c if (c.isalnum() or c in ["_", "-"]) else "--") for c in settings.model]
-        )
-        + ".jsonl",
+        sanitize_checkpoint_component(settings.model) + ".jsonl",
     )
 
     lock_obj = JournalFileOpenLock(study_checkpoint_file)
@@ -688,6 +692,7 @@ def run():
     def optimize_policy_from_seed(
         seed_direction_index: float | None,
         seed_parameters: dict[str, AbliterationParameters],
+        seed_trial_index: int | None,
     ) -> tuple[float | None, dict[str, AbliterationParameters], Trial | None]:
         while True:
             try:
@@ -705,6 +710,40 @@ def run():
 
         print()
         print("[bold]Running policy optimization from selected trial...[/]")
+
+        seed_policy_fingerprint = {
+            "direction_index": seed_direction_index,
+            "parameters": {
+                component: asdict(component_parameters)
+                for component, component_parameters in sorted(seed_parameters.items())
+            },
+        }
+        seed_policy_hash = hashlib.sha256(
+            json.dumps(seed_policy_fingerprint, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+        seed_tag = (
+            f"trial-{seed_trial_index}"
+            if seed_trial_index is not None
+            else f"policy-{seed_policy_hash}"
+        )
+
+        policy_study_checkpoint_file = os.path.join(
+            settings.study_checkpoint_dir,
+            "--".join(
+                [
+                    sanitize_checkpoint_component(settings.model),
+                    "policy-opt",
+                    sanitize_checkpoint_component(seed_tag),
+                ]
+            )
+            + ".jsonl",
+        )
+        policy_lock_obj = JournalFileOpenLock(policy_study_checkpoint_file)
+        policy_backend = JournalFileBackend(
+            policy_study_checkpoint_file,
+            lock_obj=policy_lock_obj,
+        )
+        policy_storage = JournalStorage(policy_backend)
 
         last_layer_index = len(model.get_layers()) - 1
 
@@ -781,6 +820,9 @@ def run():
                 multivariate=True,
             ),
             directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
+            storage=policy_storage,
+            study_name="heretic-policy-opt",
+            load_if_exists=True,
         )
 
         seed_trial_params = {
@@ -1037,6 +1079,7 @@ def run():
                             ) = optimize_policy_from_seed(
                                 active_direction_index,
                                 active_parameters,
+                                active_trial.user_attrs.get("index"),
                             )
                             if refined_policy_trial is not None:
                                 active_trial = refined_policy_trial
