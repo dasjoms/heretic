@@ -305,6 +305,11 @@ class Settings(BaseSettings):
         description="Whether to print prompt/response pairs when counting refusals.",
     )
 
+    verbose: bool = Field(
+        default=False,
+        description="Whether to print additional debug logs during optimization and evaluation.",
+    )
+
     print_residual_geometry: bool = Field(
         default=False,
         description="Whether to print detailed information about residuals and refusal directions.",

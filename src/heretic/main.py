@@ -660,7 +660,12 @@ def run():
         print("* Resetting model...")
         model.reset_model()
         print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters)
+        model.abliterate(
+            refusal_directions,
+            direction_index,
+            parameters,
+            require_reset=True,
+        )
         print("* Evaluating...")
         score, kl_divergence, refusals = evaluator.get_score()
 
@@ -805,9 +810,23 @@ def run():
 
             print("* Resetting model...")
             model.reset_model()
+            if settings.verbose:
+                print("[grey50][debug] Policy evaluation model reset completed.[/]")
             print("* Abliterating...")
-            model.abliterate(refusal_directions, direction_index, parameters)
+            if settings.verbose:
+                debug_parameters = {k: asdict(v) for k, v in parameters.items()}
+                print(
+                    f"[grey50][debug] Applying candidate policy parameters: direction_index={direction_index}, parameters={debug_parameters}[/]"
+                )
+            model.abliterate(
+                refusal_directions,
+                direction_index,
+                parameters,
+                require_reset=True,
+            )
             print("* Evaluating...")
+            if settings.verbose:
+                print("[grey50][debug] Policy evaluation started.[/]")
             score, kl_divergence, refusals = evaluator.get_score()
 
             policy_trial.set_user_attr("kl_divergence", kl_divergence)
@@ -881,7 +900,12 @@ def run():
         )
         print("* Loading best refined policy...")
         model.reset_model()
-        model.abliterate(refusal_directions, best_direction_index, best_parameters)
+        model.abliterate(
+            refusal_directions,
+            best_direction_index,
+            best_parameters,
+            require_reset=True,
+        )
 
         return best_direction_index, best_parameters, best_policy_trial
 
@@ -1050,6 +1074,7 @@ def run():
                 refusal_directions,
                 active_direction_index,
                 active_parameters,
+                require_reset=True,
             )
 
             while True:

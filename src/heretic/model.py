@@ -61,6 +61,7 @@ class Model:
         self.settings = settings
         self.response_prefix = ""
         self.needs_reload = False
+        self.policy_reset_required = False
 
         print()
         print(f"Loading model [bold]{settings.model}[/]...")
@@ -281,6 +282,7 @@ class Model:
             for name, module in self.model.named_modules():
                 if "lora_B" in name and hasattr(module, "weight"):
                     torch.nn.init.zeros_(module.weight)
+            self.policy_reset_required = False
             return
 
         dtype = self.model.dtype
@@ -308,6 +310,7 @@ class Model:
         self._apply_lora()
 
         self.needs_reload = False
+        self.policy_reset_required = False
 
     def get_layers(self) -> ModuleList:
         model = self.model
@@ -381,7 +384,14 @@ class Model:
         refusal_directions: Tensor,
         direction_index: float | None,
         parameters: dict[str, AbliterationParameters],
+        *,
+        require_reset: bool = False,
     ):
+        if require_reset:
+            assert not self.policy_reset_required, (
+                "Detected chained policy application without reset_model(); "
+                "call reset_model() before abliterate() in policy evaluation."
+            )
         if direction_index is None:
             refusal_direction = None
         else:
@@ -518,6 +528,8 @@ class Model:
                     weight_B = cast(Tensor, module.lora_B["default"].weight)
                     weight_A.data = lora_A.to(weight_A.dtype)
                     weight_B.data = lora_B.to(weight_B.dtype)
+
+        self.policy_reset_required = True
 
     def generate(
         self,
