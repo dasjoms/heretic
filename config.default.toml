@@ -109,8 +109,19 @@ policy_local_perturbation_scale = 0.03
 # Minimum refusal-rate improvement required for a policy optimization trial to be accepted.
 # policy_min_refusal_improvement = 0.01
 
-# Whether to re-estimate refusal directions during policy optimization.
+# Deprecated compatibility flag. If true and policy_refusal_directions_mode is unset,
+# mode behaves like "recompute".
 policy_reestimate_refusal_directions = false
+
+# Refusal-direction policy mode during policy optimization.
+# "reuse" = reuse initial refusal directions (default),
+# "recompute" = recompute directions once before policy optimization,
+# "periodic" = recompute before policy optimization and optionally refresh every N trials.
+policy_refusal_directions_mode = "reuse"
+
+# Optional periodic refresh interval (in policy trials) when
+# policy_refusal_directions_mode = "periodic". Disabled by default.
+# policy_refusal_directions_refresh_interval = 10
 
 # Optional directory override for policy optimization checkpoints.
 # policy_checkpoint_dir = "policy_checkpoints"

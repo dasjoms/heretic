@@ -216,6 +216,37 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
         return "merge"
 
 
+def calculate_refusal_directions(
+    settings: Settings,
+    model: Model,
+    good_prompts: list[str],
+    bad_prompts: list[str],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    print("Calculating per-layer refusal directions...")
+    print("* Obtaining residuals for good prompts...")
+    good_residuals = model.get_residuals_batched(good_prompts)
+    print("* Obtaining residuals for bad prompts...")
+    bad_residuals = model.get_residuals_batched(bad_prompts)
+
+    good_means = good_residuals.mean(dim=0)
+    bad_means = bad_residuals.mean(dim=0)
+
+    refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
+
+    if settings.orthogonalize_direction:
+        # Implements https://huggingface.co/blog/grimjim/projected-abliteration
+        # Adjust the refusal directions so that only the component that is
+        # orthogonal to the good direction is subtracted during abliteration.
+        good_directions = F.normalize(good_means, p=2, dim=1)
+        projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
+        refusal_directions = (
+            refusal_directions - projection_vector.unsqueeze(1) * good_directions
+        )
+        refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
+
+    return refusal_directions, good_residuals, bad_residuals
+
+
 def run():
     # Enable expandable segments to reduce memory fragmentation on multi-GPU setups.
     if (
@@ -541,27 +572,12 @@ def run():
         return
 
     print()
-    print("Calculating per-layer refusal directions...")
-    print("* Obtaining residuals for good prompts...")
-    good_residuals = model.get_residuals_batched(good_prompts)
-    print("* Obtaining residuals for bad prompts...")
-    bad_residuals = model.get_residuals_batched(bad_prompts)
-
-    good_means = good_residuals.mean(dim=0)
-    bad_means = bad_residuals.mean(dim=0)
-
-    refusal_directions = F.normalize(bad_means - good_means, p=2, dim=1)
-
-    if settings.orthogonalize_direction:
-        # Implements https://huggingface.co/blog/grimjim/projected-abliteration
-        # Adjust the refusal directions so that only the component that is
-        # orthogonal to the good direction is subtracted during abliteration.
-        good_directions = F.normalize(good_means, p=2, dim=1)
-        projection_vector = torch.sum(refusal_directions * good_directions, dim=1)
-        refusal_directions = (
-            refusal_directions - projection_vector.unsqueeze(1) * good_directions
-        )
-        refusal_directions = F.normalize(refusal_directions, p=2, dim=1)
+    refusal_directions, good_residuals, bad_residuals = calculate_refusal_directions(
+        settings,
+        model,
+        good_prompts,
+        bad_prompts,
+    )
 
     analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
 
@@ -754,6 +770,8 @@ def run():
         seed_parameters: dict[str, AbliterationParameters],
         seed_trial_index: int | None,
     ) -> tuple[float | None, dict[str, AbliterationParameters], Trial | None]:
+        nonlocal refusal_directions
+
         def prompt_optional_float(prompt: str) -> float | None:
             while True:
                 value = prompt_text(prompt)
@@ -774,6 +792,25 @@ def run():
                 except ValueError:
                     print("[red]Please enter a whole number, or leave blank to skip.[/]")
 
+        policy_mode = settings.policy_refusal_directions_mode
+        refresh_interval = settings.policy_refusal_directions_refresh_interval
+        if policy_mode != "periodic":
+            refresh_interval = None
+
+        def refresh_refusal_directions(reason: str) -> None:
+            nonlocal refusal_directions
+            print(f"* {reason}")
+            model.reset_model()
+            refusal_directions, _, _ = calculate_refusal_directions(
+                settings,
+                model,
+                good_prompts,
+                bad_prompts,
+            )
+            print(
+                "* Refusal directions updated. KL/refusal scoring baseline remains fixed to the original model."
+            )
+
         while True:
             try:
                 n_trials = prompt_text(
@@ -792,6 +829,14 @@ def run():
         print("[bold]Running policy optimization from selected trial...[/]")
         print("* Re-initializing evaluation baseline from unedited model...")
         evaluator.initialize_baseline()
+        if policy_mode in ["recompute", "periodic"]:
+            refresh_refusal_directions(
+                "Recomputing refusal directions before policy optimization"
+            )
+            if policy_mode == "periodic" and refresh_interval is None:
+                print(
+                    "* Policy periodic refresh interval is not set; using only the initial policy-phase recomputation."
+                )
         print("* Evaluating seed policy...")
         model.reset_model()
         model.abliterate(
@@ -883,7 +928,21 @@ def run():
             "refusal_improvement_delta": refusal_improvement_delta,
         })
 
+        policy_trial_count = 0
+
         def policy_objective(policy_trial: Trial) -> tuple[float, float]:
+            nonlocal policy_trial_count
+            if (
+                policy_mode == "periodic"
+                and refresh_interval is not None
+                and refresh_interval > 0
+                and policy_trial_count > 0
+                and policy_trial_count % refresh_interval == 0
+            ):
+                refresh_refusal_directions(
+                    f"Periodic refusal-direction refresh before policy trial {policy_trial.number}"
+                )
+
             direction_scope = sample_direction_scope(policy_trial)
 
             direction_index = sample_direction_index(
@@ -984,6 +1043,7 @@ def run():
             ):
                 accepted = False
             policy_trial.set_user_attr("accepted", accepted)
+            policy_trial_count += 1
 
             return score
 

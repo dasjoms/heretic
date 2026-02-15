@@ -102,6 +102,12 @@ class RowNormalization(str, Enum):
     FULL = "full"
 
 
+class PolicyRefusalDirectionsMode(str, Enum):
+    REUSE = "reuse"
+    RECOMPUTE = "recompute"
+    PERIODIC = "periodic"
+
+
 class PromptSourceType(str, Enum):
     DATASET = "dataset"
     TEXT_FILE = "text_file"
@@ -427,7 +433,29 @@ class Settings(BaseSettings):
 
     policy_reestimate_refusal_directions: bool = Field(
         default=False,
-        description="Whether to re-estimate refusal directions during policy optimization.",
+        description=(
+            "Deprecated compatibility flag for refusal-direction refresh during policy optimization. "
+            "Set policy_refusal_directions_mode to 'recompute' or 'periodic' instead."
+        ),
+    )
+
+    policy_refusal_directions_mode: PolicyRefusalDirectionsMode = Field(
+        default=PolicyRefusalDirectionsMode.REUSE,
+        description=(
+            "Refusal-direction policy mode during policy optimization. Options: "
+            '"reuse" (reuse initial directions), '
+            '"recompute" (recompute once before policy optimization), '
+            '"periodic" (recompute before policy optimization and optionally refresh every N policy trials).'
+        ),
+    )
+
+    policy_refusal_directions_refresh_interval: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional periodic refresh interval (in policy trials) used when "
+            "policy_refusal_directions_mode = 'periodic'. Disabled by default."
+        ),
     )
 
     policy_checkpoint_dir: str | None = Field(
@@ -520,6 +548,23 @@ class Settings(BaseSettings):
         ),
         description="Dataset of prompts that tend to result in refusals (used for evaluating model performance).",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_policy_refusal_direction_settings(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        if (
+            "policy_refusal_directions_mode" not in normalized
+            and normalized.get("policy_reestimate_refusal_directions")
+        ):
+            normalized["policy_refusal_directions_mode"] = (
+                PolicyRefusalDirectionsMode.RECOMPUTE
+            )
+
+        return normalized
 
     @classmethod
     def settings_customise_sources(
