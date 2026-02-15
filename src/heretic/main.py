@@ -710,6 +710,8 @@ def run():
 
         print()
         print("[bold]Running policy optimization from selected trial...[/]")
+        print("* Re-initializing evaluation baseline from unedited model...")
+        evaluator.initialize_baseline()
 
         seed_policy_fingerprint = {
             "direction_index": seed_direction_index,
