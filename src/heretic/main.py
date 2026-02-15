@@ -247,6 +247,100 @@ def calculate_refusal_directions(
     return refusal_directions, good_residuals, bad_residuals
 
 
+def format_metadata_parameters(
+    direction_index: float | None,
+    parameters: dict[str, AbliterationParameters],
+) -> dict[str, object]:
+    formatted = {
+        "direction_index": (
+            "per layer" if direction_index is None else round(direction_index, 6)
+        ),
+        "parameters": {k: asdict(v) for k, v in sorted(parameters.items())},
+    }
+    return formatted
+
+
+def build_model_card_metadata(
+    settings: Settings,
+    trial: Trial,
+    direction_index: float | None,
+    parameters: dict[str, AbliterationParameters],
+    bad_prompt_count: int,
+    seed_trial_index: int | None,
+    seed_direction_index: float | None,
+    seed_parameters: dict[str, AbliterationParameters] | None,
+) -> tuple[dict[str, object], str, list[str]]:
+    policy_optimized = seed_parameters is not None
+    metadata = {
+        "heretic_base_model": settings.model,
+        "heretic_policy_optimization_enabled": policy_optimized,
+        "heretic_initial_trial_id": (
+            seed_trial_index if policy_optimized else trial.user_attrs.get("index")
+        ),
+        "heretic_initial_trial_parameters": (
+            format_metadata_parameters(seed_direction_index, seed_parameters)
+            if policy_optimized and seed_parameters is not None
+            else format_metadata_parameters(direction_index, parameters)
+        ),
+        "heretic_policy_run_id": (
+            trial.user_attrs.get("policy_run_id") if policy_optimized else None
+        ),
+        "heretic_policy_checkpoint": (
+            trial.user_attrs.get("policy_checkpoint_file") if policy_optimized else None
+        ),
+        "heretic_final_refined_parameters": format_metadata_parameters(
+            direction_index,
+            parameters,
+        ),
+        "heretic_selection_metrics": {
+            "kl_divergence": round(trial.user_attrs["kl_divergence"], 6),
+            "refusals": trial.user_attrs["refusals"],
+            "bad_prompt_count": bad_prompt_count,
+            "base_refusals": trial.user_attrs.get("seed_refusals"),
+            "refusal_change": trial.user_attrs.get("refusal_change"),
+            "kl_change": trial.user_attrs.get("kl_change"),
+        },
+    }
+
+    metadata_lines = []
+    for key, value in metadata.items():
+        serialized = json.dumps("n/a") if value is None else json.dumps(
+            value,
+            indent=2,
+            sort_keys=True,
+        )
+        metadata_lines.append(f"- **{key}**\n\n```json\n{serialized}\n```")
+
+    metadata_section = "\n\n## Heretic metadata\n\n" + "\n\n".join(metadata_lines) + "\n"
+
+    metadata_tags = [
+        "heretic",
+        "uncensored",
+        "decensored",
+        "abliterated",
+        f"base_model:{settings.model}",
+        f"policy_optimization:{'enabled' if policy_optimized else 'disabled'}",
+        f"trial_id:{metadata['heretic_initial_trial_id']}",
+    ]
+
+    if metadata["heretic_policy_run_id"]:
+        metadata_tags.append(f"policy_run:{metadata['heretic_policy_run_id']}")
+
+    return metadata, metadata_section, metadata_tags
+
+
+def inject_yaml_metadata(text: str, metadata: dict[str, object], tags: list[str]) -> str:
+    yaml_lines = ["---", "tags:"]
+    yaml_lines.extend([f"  - {tag}" for tag in tags])
+    for key, value in metadata.items():
+        if value is None:
+            continue
+        serialized = json.dumps(value, sort_keys=True)
+        yaml_lines.append(f"{key}: {serialized}")
+    yaml_lines.append("---")
+    return "\n".join(yaml_lines) + "\n\n" + text.lstrip()
+
+
 def run():
     # Enable expandable segments to reduce memory fragmentation on multi-GPU setups.
     if (
@@ -1008,6 +1102,11 @@ def run():
             policy_trial.set_user_attr("candidate_deltas", deltas)
             policy_trial.set_user_attr("seed_refusals", seed_refusals)
             policy_trial.set_user_attr("seed_kl", seed_kl)
+            policy_trial.set_user_attr("policy_run_id", seed_tag)
+            policy_trial.set_user_attr(
+                "policy_checkpoint_file",
+                policy_study_checkpoint_file,
+            )
 
             print("* Resetting model...")
             model.reset_model()
@@ -1443,6 +1542,7 @@ def run():
             }
             comparison_seed_direction_index: float | None = None
             comparison_seed_parameters: dict[str, AbliterationParameters] | None = None
+            comparison_seed_trial_index: int | None = None
 
             print("* Resetting model...")
             model.reset_model()
@@ -1492,6 +1592,7 @@ def run():
                                 active_trial.user_attrs.get("index"),
                             )
                             if refined_policy_trial is not None:
+                                comparison_seed_trial_index = active_trial.user_attrs.get("index")
                                 active_trial = refined_policy_trial
                                 comparison_seed_direction_index = seed_direction_index
                                 comparison_seed_parameters = seed_parameters
@@ -1518,6 +1619,17 @@ def run():
                             if strategy is None:
                                 continue
 
+                            metadata, metadata_section, metadata_tags = build_model_card_metadata(
+                                settings,
+                                active_trial,
+                                active_direction_index,
+                                active_parameters,
+                                len(evaluator.bad_prompts),
+                                comparison_seed_trial_index,
+                                comparison_seed_direction_index,
+                                comparison_seed_parameters,
+                            )
+
                             if strategy == "adapter":
                                 print("Saving LoRA adapter...")
                                 model.model.save_pretrained(save_directory)
@@ -1528,6 +1640,22 @@ def run():
                                 del merged_model
                                 empty_cache()
                                 model.tokenizer.save_pretrained(save_directory)
+
+                            readme_text = inject_yaml_metadata(
+                                get_readme_intro(
+                                    settings,
+                                    active_trial,
+                                    evaluator.base_refusals,
+                                    evaluator.bad_prompts,
+                                )
+                                + metadata_section,
+                                metadata,
+                                metadata_tags,
+                            )
+                            Path(save_directory, "README.md").write_text(
+                                readme_text,
+                                encoding="utf-8",
+                            )
 
                             print(f"Model saved to [bold]{save_directory}[/].")
 
@@ -1590,29 +1718,45 @@ def run():
                                     token=token,
                                 )
 
+                            metadata, metadata_section, metadata_tags = build_model_card_metadata(
+                                settings,
+                                active_trial,
+                                active_direction_index,
+                                active_parameters,
+                                len(evaluator.bad_prompts),
+                                comparison_seed_trial_index,
+                                comparison_seed_direction_index,
+                                comparison_seed_parameters,
+                            )
+
+                            generated_intro = (
+                                get_readme_intro(
+                                    settings,
+                                    active_trial,
+                                    evaluator.base_refusals,
+                                    evaluator.bad_prompts,
+                                )
+                                + metadata_section
+                            )
+
                             # If the model path doesn't exist locally, it can be assumed
                             # to be a model hosted on the Hugging Face Hub, in which case
-                            # we can retrieve the model card.
+                            # we can retrieve and extend the model card.
                             if not Path(settings.model).exists():
                                 card = ModelCard.load(settings.model)
-                                if card.data is None:
-                                    card.data = ModelCardData()
-                                if card.data.tags is None:
-                                    card.data.tags = []
-                                card.data.tags.append("heretic")
-                                card.data.tags.append("uncensored")
-                                card.data.tags.append("decensored")
-                                card.data.tags.append("abliterated")
-                                card.text = (
-                                    get_readme_intro(
-                                        settings,
-                                        active_trial,
-                                        evaluator.base_refusals,
-                                        evaluator.bad_prompts,
-                                    )
-                                    + card.text
-                                )
-                                card.push_to_hub(repo_id, token=token)
+                            else:
+                                card = ModelCard("")
+
+                            if card.data is None:
+                                card.data = ModelCardData()
+                            existing_tags = card.data.tags or []
+                            card.data.tags = sorted(set(existing_tags + metadata_tags))
+                            card.text = inject_yaml_metadata(
+                                generated_intro + card.text,
+                                metadata,
+                                card.data.tags,
+                            )
+                            card.push_to_hub(repo_id, token=token)
 
                             print(f"Model uploaded to [bold]{repo_id}[/].")
 
