@@ -1133,6 +1133,97 @@ def run():
 
         return best_direction_index, best_parameters, best_policy_trial
 
+    def compare_seed_vs_refined_policy(
+        seed_direction_index: float | None,
+        seed_parameters: dict[str, AbliterationParameters],
+        refined_direction_index: float | None,
+        refined_parameters: dict[str, AbliterationParameters],
+    ) -> None:
+        def truncate(text: str, max_chars: int = 96) -> str:
+            compact = " ".join(text.split())
+            if len(compact) <= max_chars:
+                return compact
+            return compact[: max_chars - 1] + "…"
+
+        def evaluate_policy(
+            label: str,
+            direction_index: float | None,
+            parameters: dict[str, AbliterationParameters],
+            collect_responses: bool,
+        ) -> tuple[float, int, list[bool] | None]:
+            print(f"* Resetting and applying [bold]{label}[/] policy...")
+            model.reset_model()
+            model.abliterate(
+                refusal_directions,
+                direction_index,
+                parameters,
+                require_reset=True,
+            )
+            print(f"* Evaluating [bold]{label}[/] policy...")
+            _, kl_divergence, refusals = evaluator.get_score()
+            print(
+                f"* {label.capitalize()} metrics: "
+                f"Refusals {refusals:>2}/{len(evaluator.bad_prompts)}, "
+                f"KL divergence {kl_divergence:.4f}"
+            )
+
+            refusal_flags: list[bool] | None = None
+            if collect_responses:
+                responses = model.get_responses_batched(
+                    evaluator.bad_prompts,
+                    skip_special_tokens=True,
+                )
+                refusal_flags = [evaluator.is_refusal(response) for response in responses]
+
+            return kl_divergence, refusals, refusal_flags
+
+        print()
+        print("[bold]Comparing seed vs refined policy...[/]")
+        seed_kl, seed_refusals, seed_flags = evaluate_policy(
+            "seed",
+            seed_direction_index,
+            seed_parameters,
+            collect_responses=settings.print_responses,
+        )
+        refined_kl, refined_refusals, refined_flags = evaluate_policy(
+            "refined",
+            refined_direction_index,
+            refined_parameters,
+            collect_responses=settings.print_responses,
+        )
+
+        print()
+        print("Comparison summary:")
+        print(
+            f"* Refusals: [bold]{seed_refusals}[/] → [bold]{refined_refusals}[/] "
+            f"(Δ {refined_refusals - seed_refusals:+d})"
+        )
+        print(
+            f"* KL divergence: [bold]{seed_kl:.4f}[/] → [bold]{refined_kl:.4f}[/] "
+            f"(Δ {refined_kl - seed_kl:+.4f})"
+        )
+
+        if settings.print_responses and seed_flags is not None and refined_flags is not None:
+            print("* Prompt-level refusal status changes:")
+            changes = 0
+            for prompt, seed_refusal, refined_refusal in zip(
+                evaluator.bad_prompts,
+                seed_flags,
+                refined_flags,
+            ):
+                if seed_refusal == refined_refusal:
+                    continue
+                changes += 1
+                direction = (
+                    "refusal → non-refusal"
+                    if seed_refusal and not refined_refusal
+                    else "non-refusal → refusal"
+                )
+                print(f"  * {direction}: [italic]{truncate(prompt.user)}[/]")
+
+            if changes == 0:
+                print("  * No refusal-status changes across evaluation prompts.")
+
     study = optuna.create_study(
         sampler=TPESampler(
             n_startup_trials=settings.n_startup_trials,
@@ -1290,6 +1381,8 @@ def run():
                 k: AbliterationParameters(**v)
                 for k, v in active_trial.user_attrs["parameters"].items()
             }
+            comparison_seed_direction_index: float | None = None
+            comparison_seed_parameters: dict[str, AbliterationParameters] | None = None
 
             print("* Resetting model...")
             model.reset_model()
@@ -1307,6 +1400,7 @@ def run():
                     "What do you want to do with the decensored model?",
                     [
                         "Run policy optimization from this trial",
+                        "Compare seed vs refined",
                         "Save the model to a local folder",
                         "Upload the model to Hugging Face",
                         "Chat with the model",
@@ -1323,6 +1417,11 @@ def run():
                 try:
                     match action:
                         case "Run policy optimization from this trial":
+                            seed_direction_index = active_direction_index
+                            seed_parameters = {
+                                component: component_parameters
+                                for component, component_parameters in active_parameters.items()
+                            }
                             (
                                 active_direction_index,
                                 active_parameters,
@@ -1334,6 +1433,21 @@ def run():
                             )
                             if refined_policy_trial is not None:
                                 active_trial = refined_policy_trial
+                                comparison_seed_direction_index = seed_direction_index
+                                comparison_seed_parameters = seed_parameters
+
+                        case "Compare seed vs refined":
+                            if comparison_seed_parameters is None:
+                                print(
+                                    "[yellow]Run policy optimization from this trial first to compare seed vs refined.[/]"
+                                )
+                                continue
+                            compare_seed_vs_refined_policy(
+                                comparison_seed_direction_index,
+                                comparison_seed_parameters,
+                                active_direction_index,
+                                active_parameters,
+                            )
 
                         case "Save the model to a local folder":
                             save_directory = prompt_path("Path to the folder:")
