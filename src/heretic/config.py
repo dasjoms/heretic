@@ -416,6 +416,12 @@ class Settings(BaseSettings):
         description="Number of policy optimization trials to run.",
     )
 
+    policy_optimization_iterations: int = Field(
+        default=1,
+        ge=1,
+        description="Number of sequential policy optimization iterations to run.",
+    )
+
     policy_local_perturbation_scale: float = Field(
         default=0.03,
         description="Scale of local perturbations around the seed policy during policy optimization.",
