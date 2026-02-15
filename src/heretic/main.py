@@ -685,6 +685,162 @@ def run():
             trial.study.stop()
             raise TrialPruned()
 
+    def optimize_policy_from_seed(
+        seed_direction_index: float | None,
+        seed_parameters: dict[str, AbliterationParameters],
+    ) -> tuple[float | None, dict[str, AbliterationParameters], Trial | None]:
+        while True:
+            try:
+                n_trials = prompt_text(
+                    "How many policy optimization trials do you want to run?",
+                )
+                if n_trials is None or n_trials == "":
+                    return seed_direction_index, seed_parameters, None
+                n_trials = int(n_trials)
+                if n_trials > 0:
+                    break
+                print("[red]Please enter a number greater than 0.[/]")
+            except ValueError:
+                print("[red]Please enter a number.[/]")
+
+        print()
+        print("[bold]Running policy optimization from selected trial...[/]")
+
+        last_layer_index = len(model.get_layers()) - 1
+
+        def policy_objective(policy_trial: Trial) -> tuple[float, float]:
+            direction_scope = policy_trial.suggest_categorical(
+                "direction_scope",
+                [
+                    "global",
+                    "per layer",
+                ],
+            )
+
+            direction_index = policy_trial.suggest_float(
+                "direction_index",
+                0.4 * last_layer_index,
+                0.9 * last_layer_index,
+            )
+
+            if direction_scope == "per layer":
+                direction_index = None
+
+            parameters = {}
+
+            for component in model.get_abliterable_components():
+                max_weight = policy_trial.suggest_float(
+                    f"{component}.max_weight",
+                    0.8,
+                    1.5,
+                )
+                max_weight_position = policy_trial.suggest_float(
+                    f"{component}.max_weight_position",
+                    0.6 * last_layer_index,
+                    1.0 * last_layer_index,
+                )
+                min_weight = policy_trial.suggest_float(
+                    f"{component}.min_weight",
+                    0.0,
+                    1.0,
+                )
+                min_weight_distance = policy_trial.suggest_float(
+                    f"{component}.min_weight_distance",
+                    1.0,
+                    0.6 * last_layer_index,
+                )
+
+                parameters[component] = AbliterationParameters(
+                    max_weight=max_weight,
+                    max_weight_position=max_weight_position,
+                    min_weight=(min_weight * max_weight),
+                    min_weight_distance=min_weight_distance,
+                )
+
+            policy_trial.set_user_attr("direction_index", direction_index)
+            policy_trial.set_user_attr(
+                "parameters", {k: asdict(v) for k, v in parameters.items()}
+            )
+
+            print("* Resetting model...")
+            model.reset_model()
+            print("* Abliterating...")
+            model.abliterate(refusal_directions, direction_index, parameters)
+            print("* Evaluating...")
+            score, kl_divergence, refusals = evaluator.get_score()
+
+            policy_trial.set_user_attr("kl_divergence", kl_divergence)
+            policy_trial.set_user_attr("refusals", refusals)
+
+            return score
+
+        policy_study = optuna.create_study(
+            sampler=TPESampler(
+                n_startup_trials=min(settings.n_startup_trials, n_trials),
+                n_ei_candidates=128,
+                multivariate=True,
+            ),
+            directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
+        )
+
+        seed_trial_params = {
+            "direction_scope": (
+                "global" if seed_direction_index is not None else "per layer"
+            ),
+            "direction_index": (
+                seed_direction_index
+                if seed_direction_index is not None
+                else 0.65 * last_layer_index
+            ),
+        }
+        for component, component_parameters in seed_parameters.items():
+            seed_trial_params[f"{component}.max_weight"] = component_parameters.max_weight
+            seed_trial_params[f"{component}.max_weight_position"] = (
+                component_parameters.max_weight_position
+            )
+            seed_trial_params[f"{component}.min_weight"] = (
+                component_parameters.min_weight / component_parameters.max_weight
+                if component_parameters.max_weight > 0
+                else 0.0
+            )
+            seed_trial_params[f"{component}.min_weight_distance"] = (
+                component_parameters.min_weight_distance
+            )
+
+        policy_study.enqueue_trial(seed_trial_params)
+        policy_study.optimize(policy_objective, n_trials=n_trials)
+
+        completed_trials = [
+            t for t in policy_study.trials if t.state == TrialState.COMPLETE
+        ]
+        if not completed_trials:
+            return seed_direction_index, seed_parameters, None
+
+        best_policy_trial = min(
+            completed_trials,
+            key=lambda t: (
+                t.user_attrs["refusals"],
+                t.user_attrs["kl_divergence"],
+            ),
+        )
+        best_direction_index = best_policy_trial.user_attrs["direction_index"]
+        best_parameters = {
+            k: AbliterationParameters(**v)
+            for k, v in best_policy_trial.user_attrs["parameters"].items()
+        }
+
+        print()
+        print(
+            "Best refined policy: "
+            f"Refusals {best_policy_trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)}, "
+            f"KL divergence {best_policy_trial.user_attrs['kl_divergence']:.4f}"
+        )
+        print("* Loading best refined policy...")
+        model.reset_model()
+        model.abliterate(refusal_directions, best_direction_index, best_parameters)
+
+        return best_direction_index, best_parameters, best_policy_trial
+
     study = optuna.create_study(
         sampler=TPESampler(
             n_startup_trials=settings.n_startup_trials,
@@ -835,16 +991,21 @@ def run():
             print("* Parameters:")
             for name, value in get_trial_parameters(trial).items():
                 print(f"  * {name} = [bold]{value}[/]")
+
+            active_trial = trial
+            active_direction_index = active_trial.user_attrs["direction_index"]
+            active_parameters = {
+                k: AbliterationParameters(**v)
+                for k, v in active_trial.user_attrs["parameters"].items()
+            }
+
             print("* Resetting model...")
             model.reset_model()
             print("* Abliterating...")
             model.abliterate(
                 refusal_directions,
-                trial.user_attrs["direction_index"],
-                {
-                    k: AbliterationParameters(**v)
-                    for k, v in trial.user_attrs["parameters"].items()
-                },
+                active_direction_index,
+                active_parameters,
             )
 
             while True:
@@ -852,6 +1013,7 @@ def run():
                 action = prompt_select(
                     "What do you want to do with the decensored model?",
                     [
+                        "Run policy optimization from this trial",
                         "Save the model to a local folder",
                         "Upload the model to Hugging Face",
                         "Chat with the model",
@@ -867,6 +1029,18 @@ def run():
                 # the optimized model.
                 try:
                     match action:
+                        case "Run policy optimization from this trial":
+                            (
+                                active_direction_index,
+                                active_parameters,
+                                refined_policy_trial,
+                            ) = optimize_policy_from_seed(
+                                active_direction_index,
+                                active_parameters,
+                            )
+                            if refined_policy_trial is not None:
+                                active_trial = refined_policy_trial
+
                         case "Save the model to a local folder":
                             save_directory = prompt_path("Path to the folder:")
                             if not save_directory:
@@ -964,7 +1138,7 @@ def run():
                                 card.text = (
                                     get_readme_intro(
                                         settings,
-                                        trial,
+                                        active_trial,
                                         evaluator.base_refusals,
                                         evaluator.bad_prompts,
                                     )
