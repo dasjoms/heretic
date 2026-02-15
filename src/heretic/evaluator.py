@@ -28,15 +28,22 @@ class Evaluator:
         self.good_prompts = load_prompts(settings, settings.good_evaluation_prompts)
         print(f"* [bold]{len(self.good_prompts)}[/] prompts loaded")
 
-        print("* Obtaining first-token probability distributions...")
-        self.base_logprobs = model.get_logprobs_batched(self.good_prompts)
-
         print()
         print(
             f"Loading bad evaluation prompts from [bold]{settings.bad_evaluation_prompts.source_label()}[/]..."
         )
         self.bad_prompts = load_prompts(settings, settings.bad_evaluation_prompts)
         print(f"* [bold]{len(self.bad_prompts)}[/] prompts loaded")
+
+        self.initialize_baseline(reset_model=False)
+
+    def initialize_baseline(self, reset_model: bool = True) -> None:
+        if reset_model:
+            print("* Resetting model to baseline...")
+            self.model.reset_model()
+
+        print("* Obtaining first-token probability distributions...")
+        self.base_logprobs = self.model.get_logprobs_batched(self.good_prompts)
 
         print("* Counting model refusals...")
         self.base_refusals = self.count_refusals()
