@@ -91,6 +91,27 @@ n_trials = 400
 # Number of trials that use random sampling for the purpose of exploration.
 n_startup_trials = 60
 
+# Whether to run policy optimization after abliteration parameter optimization.
+policy_optimization_enabled = false
+
+# Number of policy optimization trials to run.
+policy_n_trials = 40
+
+# Scale of local perturbations around the seed policy during policy optimization.
+policy_local_perturbation_scale = 0.03
+
+# Hard KL-divergence ceiling for policy optimization; trials above it are rejected.
+# policy_hard_kl_ceiling = 0.02
+
+# Minimum refusal-rate improvement required for a policy optimization trial to be accepted.
+# policy_min_refusal_improvement = 0.01
+
+# Whether to re-estimate refusal directions during policy optimization.
+policy_reestimate_refusal_directions = false
+
+# Optional directory override for policy optimization checkpoints.
+# policy_checkpoint_dir = "policy_checkpoints"
+
 # Directory to save and load study progress to/from.
 study_checkpoint_dir = "checkpoints"
 

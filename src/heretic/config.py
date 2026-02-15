@@ -395,6 +395,41 @@ class Settings(BaseSettings):
         description="Number of trials that use random sampling for the purpose of exploration.",
     )
 
+    policy_optimization_enabled: bool = Field(
+        default=False,
+        description="Whether to run policy optimization after abliteration parameter optimization.",
+    )
+
+    policy_n_trials: int = Field(
+        default=40,
+        description="Number of policy optimization trials to run.",
+    )
+
+    policy_local_perturbation_scale: float = Field(
+        default=0.03,
+        description="Scale of local perturbations around the seed policy during policy optimization.",
+    )
+
+    policy_hard_kl_ceiling: float | None = Field(
+        default=None,
+        description="Hard KL-divergence ceiling for policy optimization; trials above it are rejected.",
+    )
+
+    policy_min_refusal_improvement: float | None = Field(
+        default=None,
+        description="Minimum refusal-rate improvement required for a policy optimization trial to be accepted.",
+    )
+
+    policy_reestimate_refusal_directions: bool = Field(
+        default=False,
+        description="Whether to re-estimate refusal directions during policy optimization.",
+    )
+
+    policy_checkpoint_dir: str | None = Field(
+        default=None,
+        description="Optional directory override for policy optimization checkpoints.",
+    )
+
     study_checkpoint_dir: str = Field(
         default="checkpoints",
         description="Directory to save and load study progress to/from.",
