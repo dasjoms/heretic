@@ -754,6 +754,26 @@ def run():
         seed_parameters: dict[str, AbliterationParameters],
         seed_trial_index: int | None,
     ) -> tuple[float | None, dict[str, AbliterationParameters], Trial | None]:
+        def prompt_optional_float(prompt: str) -> float | None:
+            while True:
+                value = prompt_text(prompt)
+                if value is None or value == "":
+                    return None
+                try:
+                    return float(value)
+                except ValueError:
+                    print("[red]Please enter a number, or leave blank to skip.[/]")
+
+        def prompt_optional_int(prompt: str) -> int | None:
+            while True:
+                value = prompt_text(prompt)
+                if value is None or value == "":
+                    return None
+                try:
+                    return int(value)
+                except ValueError:
+                    print("[red]Please enter a whole number, or leave blank to skip.[/]")
+
         while True:
             try:
                 n_trials = prompt_text(
@@ -772,6 +792,26 @@ def run():
         print("[bold]Running policy optimization from selected trial...[/]")
         print("* Re-initializing evaluation baseline from unedited model...")
         evaluator.initialize_baseline()
+        print("* Evaluating seed policy...")
+        model.reset_model()
+        model.abliterate(
+            refusal_directions,
+            seed_direction_index,
+            seed_parameters,
+            require_reset=True,
+        )
+        _, seed_kl, seed_refusals = evaluator.get_score()
+        print(
+            "* Seed policy metrics: "
+            f"Refusals {seed_refusals:>2}/{len(evaluator.bad_prompts)}, "
+            f"KL divergence {seed_kl:.4f}"
+        )
+
+        print("* Optional hard constraints (leave blank to disable):")
+        kl_ceiling = prompt_optional_float("Maximum KL divergence")
+        refusal_improvement_delta = prompt_optional_int(
+            "Minimum refusal reduction vs seed (e.g., 1 means refusal <= seed - 1)"
+        )
 
         seed_policy_fingerprint = {
             "direction_index": seed_direction_index,
@@ -818,11 +858,30 @@ def run():
 
         seed_policy = {
             "direction_index": seed_direction_index,
+            "seed_refusals": seed_refusals,
+            "seed_kl": seed_kl,
             "parameters": {
                 component: asdict(component_parameters)
                 for component, component_parameters in sorted(seed_parameters.items())
             },
         }
+
+        policy_study = optuna.create_study(
+            sampler=TPESampler(
+                n_startup_trials=min(settings.n_startup_trials, n_trials),
+                n_ei_candidates=128,
+                multivariate=True,
+            ),
+            directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
+            storage=policy_storage,
+            study_name="heretic-policy-opt",
+            load_if_exists=True,
+        )
+        policy_study.set_user_attr("seed_policy", seed_policy)
+        policy_study.set_user_attr("constraints", {
+            "kl_ceiling": kl_ceiling,
+            "refusal_improvement_delta": refusal_improvement_delta,
+        })
 
         def policy_objective(policy_trial: Trial) -> tuple[float, float]:
             direction_scope = sample_direction_scope(policy_trial)
@@ -888,6 +947,8 @@ def run():
             )
             policy_trial.set_user_attr("seed_policy", seed_policy)
             policy_trial.set_user_attr("candidate_deltas", deltas)
+            policy_trial.set_user_attr("seed_refusals", seed_refusals)
+            policy_trial.set_user_attr("seed_kl", seed_kl)
 
             print("* Resetting model...")
             model.reset_model()
@@ -912,20 +973,19 @@ def run():
 
             policy_trial.set_user_attr("kl_divergence", kl_divergence)
             policy_trial.set_user_attr("refusals", refusals)
+            policy_trial.set_user_attr("refusal_change", refusals - seed_refusals)
+            policy_trial.set_user_attr("kl_change", kl_divergence - seed_kl)
+
+            accepted = True
+            if kl_ceiling is not None and kl_divergence > kl_ceiling:
+                accepted = False
+            if refusal_improvement_delta is not None and (
+                refusals > seed_refusals - refusal_improvement_delta
+            ):
+                accepted = False
+            policy_trial.set_user_attr("accepted", accepted)
 
             return score
-
-        policy_study = optuna.create_study(
-            sampler=TPESampler(
-                n_startup_trials=min(settings.n_startup_trials, n_trials),
-                n_ei_candidates=128,
-                multivariate=True,
-            ),
-            directions=[StudyDirection.MINIMIZE, StudyDirection.MINIMIZE],
-            storage=policy_storage,
-            study_name="heretic-policy-opt",
-            load_if_exists=True,
-        )
 
         seed_trial_params = {
             "direction_scope": (
@@ -956,13 +1016,98 @@ def run():
         if not completed_trials:
             return seed_direction_index, seed_parameters, None
 
+        accepted_trials = [
+            t for t in completed_trials if t.user_attrs.get("accepted", True)
+        ]
+        candidate_pool = accepted_trials if accepted_trials else completed_trials
+
+        sorted_trials = sorted(
+            candidate_pool,
+            key=lambda trial: (
+                trial.user_attrs["refusals"],
+                trial.user_attrs["kl_divergence"],
+            ),
+        )
+        min_divergence = math.inf
+        pareto_trials = []
+        for trial in sorted_trials:
+            kl_divergence = trial.user_attrs["kl_divergence"]
+            if kl_divergence < min_divergence:
+                min_divergence = kl_divergence
+                pareto_trials.append(trial)
+
         best_policy_trial = min(
-            completed_trials,
+            candidate_pool,
             key=lambda t: (
                 t.user_attrs["refusals"],
                 t.user_attrs["kl_divergence"],
             ),
         )
+        lowest_kl_trial = min(candidate_pool, key=lambda t: t.user_attrs["kl_divergence"])
+
+        def signed_number(value: float, digits: int = 4) -> str:
+            return f"{value:+.{digits}f}"
+
+        print()
+        print("Policy Pareto front (changes shown vs seed policy):")
+        print(
+            f"* Seed policy: Refusals {seed_refusals:>2}/{len(evaluator.bad_prompts)}, "
+            f"KL divergence {seed_kl:.4f}"
+        )
+        if kl_ceiling is not None or refusal_improvement_delta is not None:
+            print("* Active hard constraints:")
+            if kl_ceiling is not None:
+                print(f"  * KL divergence <= [bold]{kl_ceiling:.4f}[/]")
+            if refusal_improvement_delta is not None:
+                print(
+                    "  * Refusals <= [bold]"
+                    f"{seed_refusals - refusal_improvement_delta}[/] "
+                    f"(seed {seed_refusals} - {refusal_improvement_delta})"
+                )
+        if not accepted_trials:
+            print(
+                "[yellow]No candidates satisfied the hard constraints. "
+                "Showing Pareto front across all policy trials.[/]"
+            )
+
+        choices = []
+        for trial in pareto_trials:
+            refusal_change = trial.user_attrs.get(
+                "refusal_change",
+                trial.user_attrs["refusals"] - seed_refusals,
+            )
+            kl_change = trial.user_attrs.get(
+                "kl_change",
+                trial.user_attrs["kl_divergence"] - seed_kl,
+            )
+            marker = "[green]✓ accepted[/]" if trial.user_attrs.get("accepted", True) else "[red]✗ rejected[/]"
+            highlight = ""
+            if trial.number == best_policy_trial.number:
+                highlight += " [bold green]★ best quality[/]"
+            if trial.number == lowest_kl_trial.number:
+                highlight += " [bold cyan]★ lowest KL[/]"
+
+            choices.append(
+                Choice(
+                    title=(
+                        f"[Trial {trial.number:>3}] "
+                        f"Refusals {trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)} "
+                        f"(Δ {signed_number(refusal_change, 0)}), "
+                        f"KL {trial.user_attrs['kl_divergence']:.4f} "
+                        f"(Δ {signed_number(kl_change)}) - {marker}{highlight}"
+                    ),
+                    value=trial,
+                )
+            )
+
+        choices.append(Choice(title="Cancel policy selection", value=""))
+        selected_policy_trial = prompt_select(
+            "Select a policy trial to load for save/upload/chat", choices
+        )
+        if selected_policy_trial is None or selected_policy_trial == "":
+            return seed_direction_index, seed_parameters, None
+
+        best_policy_trial = selected_policy_trial
         best_direction_index = best_policy_trial.user_attrs["direction_index"]
         best_parameters = {
             k: AbliterationParameters(**v)
@@ -971,11 +1116,13 @@ def run():
 
         print()
         print(
-            "Best refined policy: "
+            "Selected refined policy: "
             f"Refusals {best_policy_trial.user_attrs['refusals']:>2}/{len(evaluator.bad_prompts)}, "
-            f"KL divergence {best_policy_trial.user_attrs['kl_divergence']:.4f}"
+            f"KL divergence {best_policy_trial.user_attrs['kl_divergence']:.4f}, "
+            f"Δrefusal {best_policy_trial.user_attrs['refusal_change']:+.0f}, "
+            f"ΔKL {best_policy_trial.user_attrs['kl_change']:+.4f}"
         )
-        print("* Loading best refined policy...")
+        print("* Loading selected refined policy...")
         model.reset_model()
         model.abliterate(
             refusal_directions,
