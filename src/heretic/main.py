@@ -578,13 +578,10 @@ def run():
     trial_index = 0
     start_index = 0
     start_time = time.perf_counter()
+    last_layer_index = len(model.get_layers()) - 1
 
-    def objective(trial: Trial) -> tuple[float, float]:
-        nonlocal trial_index
-        trial_index += 1
-        trial.set_user_attr("index", trial_index)
-
-        direction_scope = trial.suggest_categorical(
+    def sample_direction_scope(trial: Trial) -> str:
+        return trial.suggest_categorical(
             "direction_scope",
             [
                 "global",
@@ -592,7 +589,101 @@ def run():
             ],
         )
 
-        last_layer_index = len(model.get_layers()) - 1
+    def sample_direction_index(
+        trial: Trial,
+        direction_scope: str,
+        seed_direction_index: float | None = None,
+        radius: float | None = None,
+        global_exploration_probability: float = 0.0,
+    ) -> float | None:
+        min_layer = 0.4 * last_layer_index
+        max_layer = 0.9 * last_layer_index
+
+        if direction_scope == "per layer":
+            return None
+
+        if (
+            seed_direction_index is not None
+            and global_exploration_probability > 0.0
+            and trial.suggest_float("global_exploration_roll", 0.0, 1.0)
+            < global_exploration_probability
+        ):
+            return trial.suggest_float("direction_index", min_layer, max_layer)
+
+        if seed_direction_index is None or radius is None:
+            return trial.suggest_float("direction_index", min_layer, max_layer)
+
+        return trial.suggest_float(
+            "direction_index",
+            max(min_layer, seed_direction_index - radius),
+            min(max_layer, seed_direction_index + radius),
+        )
+
+    def sample_component_parameters(
+        trial: Trial,
+        component: str,
+        seed_parameters: AbliterationParameters | None = None,
+        radius: dict[str, float] | None = None,
+        global_exploration_probability: float = 0.0,
+    ) -> AbliterationParameters:
+        global_ranges = {
+            "max_weight": (0.8, 1.5),
+            "max_weight_position": (0.6 * last_layer_index, 1.0 * last_layer_index),
+            "min_weight": (0.0, 1.5),
+            "min_weight_distance": (1.0, 0.6 * last_layer_index),
+        }
+
+        should_explore_global = (
+            seed_parameters is not None
+            and global_exploration_probability > 0.0
+            and trial.suggest_float(
+                f"{component}.global_exploration_roll",
+                0.0,
+                1.0,
+            )
+            < global_exploration_probability
+        )
+
+        def suggest_around_seed(parameter_name: str) -> float:
+            global_low, global_high = global_ranges[parameter_name]
+            if (
+                seed_parameters is None
+                or radius is None
+                or parameter_name not in radius
+                or should_explore_global
+            ):
+                return trial.suggest_float(
+                    f"{component}.{parameter_name}",
+                    global_low,
+                    global_high,
+                )
+
+            seed_value = getattr(seed_parameters, parameter_name)
+            parameter_radius = radius[parameter_name]
+            return trial.suggest_float(
+                f"{component}.{parameter_name}",
+                max(global_low, seed_value - parameter_radius),
+                min(global_high, seed_value + parameter_radius),
+            )
+
+        max_weight = suggest_around_seed("max_weight")
+        max_weight_position = suggest_around_seed("max_weight_position")
+        min_weight = min(max_weight, suggest_around_seed("min_weight"))
+        min_weight_distance = suggest_around_seed("min_weight_distance")
+
+        return AbliterationParameters(
+            max_weight=max_weight,
+            max_weight_position=max_weight_position,
+            min_weight=min_weight,
+            min_weight_distance=min_weight_distance,
+        )
+
+    def objective(trial: Trial) -> tuple[float, float]:
+        nonlocal trial_index
+        trial_index += 1
+        trial.set_user_attr("index", trial_index)
+
+        direction_scope = sample_direction_scope(trial)
 
         # Discrimination between "harmful" and "harmless" inputs is usually strongest
         # in layers slightly past the midpoint of the layer stack. See the original
@@ -601,50 +692,14 @@ def run():
         # Note that we always sample this parameter even though we only need it for
         # the "global" direction scope. The reason is that multivariate TPE doesn't
         # work with conditional or variable-range parameters.
-        direction_index = trial.suggest_float(
-            "direction_index",
-            0.4 * last_layer_index,
-            0.9 * last_layer_index,
-        )
-
-        if direction_scope == "per layer":
-            direction_index = None
+        direction_index = sample_direction_index(trial, direction_scope)
 
         parameters = {}
 
         for component in model.get_abliterable_components():
-            # The parameter ranges are based on experiments with various models
-            # and much wider ranges. They are not set in stone and might have to be
-            # adjusted for future models.
-            max_weight = trial.suggest_float(
-                f"{component}.max_weight",
-                0.8,
-                1.5,
-            )
-            max_weight_position = trial.suggest_float(
-                f"{component}.max_weight_position",
-                0.6 * last_layer_index,
-                1.0 * last_layer_index,
-            )
-            # For sampling purposes, min_weight is expressed as a fraction of max_weight,
-            # again because multivariate TPE doesn't support variable-range parameters.
-            # The value is transformed into the actual min_weight value below.
-            min_weight = trial.suggest_float(
-                f"{component}.min_weight",
-                0.0,
-                1.0,
-            )
-            min_weight_distance = trial.suggest_float(
-                f"{component}.min_weight_distance",
-                1.0,
-                0.6 * last_layer_index,
-            )
-
-            parameters[component] = AbliterationParameters(
-                max_weight=max_weight,
-                max_weight_position=max_weight_position,
-                min_weight=(min_weight * max_weight),
-                min_weight_distance=min_weight_distance,
+            parameters[component] = sample_component_parameters(
+                trial,
+                component,
             )
 
         trial.set_user_attr("direction_index", direction_index)
@@ -752,61 +807,87 @@ def run():
         )
         policy_storage = JournalStorage(policy_backend)
 
-        last_layer_index = len(model.get_layers()) - 1
+        policy_sampling_radius = {
+            "direction_index": 2.0,
+            "max_weight": 0.2,
+            "max_weight_position": 2.0,
+            "min_weight": 0.2,
+            "min_weight_distance": 2.0,
+        }
+        policy_global_exploration_probability = 0.15
+
+        seed_policy = {
+            "direction_index": seed_direction_index,
+            "parameters": {
+                component: asdict(component_parameters)
+                for component, component_parameters in sorted(seed_parameters.items())
+            },
+        }
 
         def policy_objective(policy_trial: Trial) -> tuple[float, float]:
-            direction_scope = policy_trial.suggest_categorical(
-                "direction_scope",
-                [
-                    "global",
-                    "per layer",
-                ],
-            )
+            direction_scope = sample_direction_scope(policy_trial)
 
-            direction_index = policy_trial.suggest_float(
-                "direction_index",
-                0.4 * last_layer_index,
-                0.9 * last_layer_index,
+            direction_index = sample_direction_index(
+                policy_trial,
+                direction_scope,
+                seed_direction_index=seed_direction_index,
+                radius=policy_sampling_radius["direction_index"],
+                global_exploration_probability=policy_global_exploration_probability,
             )
-
-            if direction_scope == "per layer":
-                direction_index = None
 
             parameters = {}
+            deltas = {
+                "direction_index": (
+                    None
+                    if direction_index is None or seed_direction_index is None
+                    else direction_index - seed_direction_index
+                ),
+                "parameters": {},
+            }
 
             for component in model.get_abliterable_components():
-                max_weight = policy_trial.suggest_float(
-                    f"{component}.max_weight",
-                    0.8,
-                    1.5,
+                component_parameters = sample_component_parameters(
+                    policy_trial,
+                    component,
+                    seed_parameters=seed_parameters[component],
+                    radius={
+                        "max_weight": policy_sampling_radius["max_weight"],
+                        "max_weight_position": policy_sampling_radius[
+                            "max_weight_position"
+                        ],
+                        "min_weight": policy_sampling_radius["min_weight"],
+                        "min_weight_distance": policy_sampling_radius[
+                            "min_weight_distance"
+                        ],
+                    },
+                    global_exploration_probability=policy_global_exploration_probability,
                 )
-                max_weight_position = policy_trial.suggest_float(
-                    f"{component}.max_weight_position",
-                    0.6 * last_layer_index,
-                    1.0 * last_layer_index,
-                )
-                min_weight = policy_trial.suggest_float(
-                    f"{component}.min_weight",
-                    0.0,
-                    1.0,
-                )
-                min_weight_distance = policy_trial.suggest_float(
-                    f"{component}.min_weight_distance",
-                    1.0,
-                    0.6 * last_layer_index,
-                )
+                parameters[component] = component_parameters
 
-                parameters[component] = AbliterationParameters(
-                    max_weight=max_weight,
-                    max_weight_position=max_weight_position,
-                    min_weight=(min_weight * max_weight),
-                    min_weight_distance=min_weight_distance,
-                )
+                seed_component = seed_parameters[component]
+                deltas["parameters"][component] = {
+                    "max_weight": (
+                        component_parameters.max_weight - seed_component.max_weight
+                    ),
+                    "max_weight_position": (
+                        component_parameters.max_weight_position
+                        - seed_component.max_weight_position
+                    ),
+                    "min_weight": (
+                        component_parameters.min_weight - seed_component.min_weight
+                    ),
+                    "min_weight_distance": (
+                        component_parameters.min_weight_distance
+                        - seed_component.min_weight_distance
+                    ),
+                }
 
             policy_trial.set_user_attr("direction_index", direction_index)
             policy_trial.set_user_attr(
                 "parameters", {k: asdict(v) for k, v in parameters.items()}
             )
+            policy_trial.set_user_attr("seed_policy", seed_policy)
+            policy_trial.set_user_attr("candidate_deltas", deltas)
 
             print("* Resetting model...")
             model.reset_model()
@@ -861,11 +942,7 @@ def run():
             seed_trial_params[f"{component}.max_weight_position"] = (
                 component_parameters.max_weight_position
             )
-            seed_trial_params[f"{component}.min_weight"] = (
-                component_parameters.min_weight / component_parameters.max_weight
-                if component_parameters.max_weight > 0
-                else 0.0
-            )
+            seed_trial_params[f"{component}.min_weight"] = component_parameters.min_weight
             seed_trial_params[f"{component}.min_weight_distance"] = (
                 component_parameters.min_weight_distance
             )
